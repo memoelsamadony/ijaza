@@ -8,10 +8,6 @@ Ijaza (Arabic: إجازة, meaning "authorization" or "permission to transmit") 
 
 Large Language Models (LLMs) frequently misquote Quranic verses — changing words, mixing verses, or even fabricating text that sounds Quranic but isn't. This is a serious concern for:
 
-- **Islamic content creators** who need accurate Quranic citations
-- **Educational platforms** teaching Quran and Islamic studies
-- **AI applications** serving Muslim communities (chatbots, translation tools, khutbah assistants)
-- **Developers** building LLM-powered tools that handle religious text
 
 Ijaza catches these errors automatically, corrects misquotations, and ensures that every Quranic verse in your application is authentic.
 
@@ -21,9 +17,11 @@ This project began as a Python reimplementation of the excellent [quran-validato
 
 Ijaza was developed as part of the [PolyKhateeb](https://github.com/memoelsamadony/polykhateeb) project — a real-time transcription and translation system for Islamic sermons (khutbahs). In that context, we needed to:
 
-- Detect Quranic segments in transcribed speech to preserve them verbatim
-- Validate LLM-corrected text to catch any misquotations
-- Inject system prompts into LLMs to properly tag Quran quotes
+=======
+# ijaza
+
+Validate and verify Quranic verses in LLM-generated text with high accuracy.
+>>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
 
 ## Installation
 
@@ -31,11 +29,14 @@ Ijaza was developed as part of the [PolyKhateeb](https://github.com/memoelsamado
 pip install ijaza
 ```
 
+<<<<<<< HEAD
 For better fuzzy matching performance (optional):
 ```bash
 pip install ijaza[performance]
 ```
 
+=======
+>>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
 ## Quick Start
 
 ### Basic Validation
@@ -82,7 +83,11 @@ for quote in result.quotes:
 - **Auto-correction**: Fixes misquoted verses automatically
 - **Detection**: Finds untagged Quran quotes in text
 - **Full database**: 6,236 verses with Uthmani script
+<<<<<<< HEAD
 - **Zero dependencies**: Pure Python implementation (optional `rapidfuzz` for performance)
+=======
+- **Zero dependencies**: Pure Python implementation
+>>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
 
 ## API Reference
 
@@ -160,6 +165,7 @@ segments = extract_arabic_segments("The verse بسم الله means...")
 similarity = calculate_similarity("text1", "text2")  # 0.0 - 1.0
 ```
 
+<<<<<<< HEAD
 ## Future Work
 
 ### Translation Validation
@@ -189,3 +195,8 @@ MIT
 - [Yazin Alirhayim](https://github.com/yazinsai) for the original [quran-validator](https://github.com/yazinsai/quran-validator) npm package
 - [AlQuran.cloud](https://alquran.cloud/) for the Quran API
 - The [PolyKhateeb](https://github.com/memoelsamadony/polykhateeb) project team
+=======
+## License
+
+MIT
+>>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
