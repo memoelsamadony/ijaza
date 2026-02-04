@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ijaza"
+version = "1.0.0"
+description = "Validate and verify Quranic verses in LLM-generated text with high accuracy"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Yazin Alirhayim", email = "yazin@example.com"},
+]
+maintainers = [
+    {name = "Yazin Alirhayim", email = "yazin@example.com"},
+]
+keywords = [
+    "quran",
+    "arabic",
+    "validation",
+    "llm",
+    "islamic",
+    "nlp",
+    "text-processing",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Linguistic",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Religion",
+    "Typing :: Typed",
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "mypy>=1.0",
+    "ruff>=0.1",
+]
+performance = [
+    "rapidfuzz>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yazin/ijaza"
+Documentation = "https://github.com/yazin/ijaza#readme"
+Repository = "https://github.com/yazin/ijaza.git"
+Issues = "https://github.com/yazin/ijaza/issues"
+Changelog = "https://github.com/yazin/ijaza/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["ijaza"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]

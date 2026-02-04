@@ -1,0 +1,4 @@
+# No required dependencies - pure Python implementation
+
+# Optional: for faster fuzzy matching (10-100x speedup)
+# rapidfuzz>=3.0
