@@ -21,7 +21,7 @@ Ijaza was developed as part of the [PolyKhateeb](https://github.com/memoelsamado
 # ijaza
 
 Validate and verify Quranic verses in LLM-generated text with high accuracy.
->>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
+
 
 ## Installation
 
@@ -36,7 +36,7 @@ pip install ijaza[performance]
 ```
 
 =======
->>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
+
 ## Quick Start
 
 ### Basic Validation
@@ -87,7 +87,7 @@ for quote in result.quotes:
 - **Zero dependencies**: Pure Python implementation (optional `rapidfuzz` for performance)
 =======
 - **Zero dependencies**: Pure Python implementation
->>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
+
 
 ## API Reference
 
@@ -199,4 +199,3 @@ MIT
 ## License
 
 MIT
->>>>>>> e3efdaf02c7f77bcc9f438c91090e370fc166ac1
