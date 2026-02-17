@@ -9,10 +9,10 @@ description = "Validate and verify Quranic verses in LLM-generated text with hig
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Yazin Alirhayim", email = "yazin@example.com"},
+    {name = "Mahmoud Elsamadony", email = "mahmoud.l.elsamadony@gmail.com"},
 ]
 maintainers = [
-    {name = "Yazin Alirhayim", email = "yazin@example.com"},
+    {name = "Mahmoud Elsamadony", email = "mahmoud.l.elsamadony@gmail.com"},
 ]
 keywords = [
     "quran",
