@@ -25,6 +25,7 @@ Ijaza was developed as part of the [PolyKhateeb](https://github.com/memoelsamado
 - Validate LLM-corrected text to catch any misquotations
 - Inject system prompts into LLMs to properly tag Quran quotes
 
+
 ## Installation
 
 ```bash
@@ -83,6 +84,7 @@ for quote in result.quotes:
 - **Detection**: Finds untagged Quran quotes in text
 - **Full database**: 6,236 verses with Uthmani script
 - **Zero dependencies**: Pure Python implementation (optional `rapidfuzz` for performance)
+
 
 ## API Reference
 
