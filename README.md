@@ -37,7 +37,7 @@ For better fuzzy matching performance (optional):
 pip install ijaza[performance]
 ```
 
-## Quick Start
+## Usage
 
 ### Basic Validation
 
@@ -48,18 +48,57 @@ validator = QuranValidator()
 
 # Validate a specific quote
 result = validator.validate("بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ")
-print(result.is_valid)   # True
-print(result.reference)  # "1:1"
-print(result.match_type) # "exact"
+print(result.is_valid)    # True
+print(result.reference)   # "1:1"
+print(result.match_type)  # "exact"
+print(result.confidence)  # 1.0
 ```
 
-### LLM Integration (Recommended)
+### Detect Quran Quotes in Text
+
+```python
+from ijaza import QuranValidator
+
+validator = QuranValidator()
+
+text = "The Prophet said to recite بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ before eating."
+detection = validator.detect_and_validate(text)
+
+for segment in detection.segments:
+    if segment.validation and segment.validation.is_valid:
+        print(f"Found: {segment.text}")
+        print(f"Reference: {segment.validation.reference}")
+```
+
+### Look Up Verses
+
+```python
+from ijaza import QuranValidator
+
+validator = QuranValidator()
+
+# Get a specific verse
+verse = validator.get_verse(surah=112, ayah=1)
+print(verse.text)         # Full text with diacritics
+print(verse.text_simple)  # Simplified text
+
+# Get a range of verses
+result = validator.get_verse_range(surah=112, start_ayah=1, end_ayah=4)
+print(result['text'])
+
+# Search for verses
+results = validator.search("الرحمن", limit=5)
+for r in results:
+    print(r)
+```
+
+### LLM Integration
 
 ```python
 from ijaza import LLMProcessor, SYSTEM_PROMPTS
 
 # 1. Add system prompt to your LLM call
-system_prompt = SYSTEM_PROMPTS['xml']
+system_prompt = SYSTEM_PROMPTS['xml']  # or 'markdown', 'bracket', 'minimal'
 
 # 2. Process LLM response
 processor = LLMProcessor()
@@ -73,6 +112,32 @@ print(result.all_valid)  # True if all quotes are authentic
 for quote in result.quotes:
     if quote.was_corrected:
         print(f"Corrected: {quote.original} -> {quote.corrected}")
+```
+
+### Quick Validate (One-liner)
+
+```python
+from ijaza import quick_validate
+
+result = quick_validate(llm_response)
+print(result['has_quran_content'])  # True/False
+print(result['all_valid'])          # True if all quotes are correct
+print(result['issues'])             # List of issues found
+```
+
+### Arabic Normalization Utilities
+
+```python
+from ijaza import normalize_arabic, remove_diacritics, contains_arabic
+
+# Normalize Arabic text for comparison
+normalized = normalize_arabic("بِسْمِ اللَّهِ")  # "بسم الله"
+
+# Remove only diacritics
+clean = remove_diacritics("السَّلَامُ")  # "السلام"
+
+# Check for Arabic content
+has_arabic = contains_arabic("Hello مرحبا")  # True
 ```
 
 ## Features

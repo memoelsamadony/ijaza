@@ -6,6 +6,7 @@ Arabic text against the authentic Quran database.
 """
 
 import json
+from importlib import resources
 from pathlib import Path
 from typing import Optional
 
@@ -38,23 +39,29 @@ DEFAULT_OPTIONS = ValidatorOptions(
 
 
 def _load_json_data(filename: str) -> list:
-    """Load JSON data from the data directory."""
-    data_dir = Path(__file__).parent.parent / 'data'
-    file_path = data_dir / filename
+    """Load bundled JSON data from package resources with a legacy fallback."""
+    candidates = [filename, filename.replace('.json', '.min.json')]
 
-    if not file_path.exists():
-        # Try minified version
-        min_filename = filename.replace('.json', '.min.json')
-        file_path = data_dir / min_filename
+    # Primary path: packaged resources (works for installed wheels)
+    package_data_dir = resources.files('ijaza').joinpath('data')
+    for candidate in candidates:
+        resource_file = package_data_dir.joinpath(candidate)
+        if resource_file.is_file():
+            with resource_file.open('r', encoding='utf-8') as f:
+                return json.load(f)
 
-    if not file_path.exists():
-        raise FileNotFoundError(
-            f"Data file not found: {filename}. "
-            "Please ensure the data files are in the 'data' directory."
-        )
+    # Legacy fallback: repository-level data/ directory (editable/dev setups)
+    legacy_data_dir = Path(__file__).parent.parent / 'data'
+    for candidate in candidates:
+        legacy_file = legacy_data_dir / candidate
+        if legacy_file.exists():
+            with open(legacy_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    raise FileNotFoundError(
+        f"Data file not found: {filename}. "
+        "Please ensure Quran data JSON files are bundled in 'ijaza/data'."
+    )
 
 
 def _parse_verse(data: dict) -> QuranVerse:
