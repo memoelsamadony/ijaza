@@ -54,11 +54,11 @@ performance = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yazin/ijaza"
-Documentation = "https://github.com/yazin/ijaza#readme"
-Repository = "https://github.com/yazin/ijaza.git"
-Issues = "https://github.com/yazin/ijaza/issues"
-Changelog = "https://github.com/yazin/ijaza/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/memoelsamadony/ijaza"
+Documentation = "https://github.com/memoelsamadony/ijaza#readme"
+Repository = "https://github.com/memoelsamadony/ijaza.git"
+Issues = "https://github.com/memoelsamadony/ijaza/issues"
+Changelog = "https://github.com/memoelsamadony/ijaza/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 packages = ["ijaza"]
