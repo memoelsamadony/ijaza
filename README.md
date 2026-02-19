@@ -125,6 +125,114 @@ print(result['all_valid'])          # True if all quotes are correct
 print(result['issues'])             # List of issues found
 ```
 
+### ASR Error Tolerance
+
+When processing speech-to-text output, Arabic ASR commonly confuses phonetically similar letters (ص/س, ط/ت, ض/د, etc.), drops function words, or produces stutters. Enable `asr_tolerant` mode for phonetic-aware matching:
+
+```python
+from ijaza import QuranValidator, ValidatorOptions
+
+validator = QuranValidator(ValidatorOptions(asr_tolerant=True))
+
+# ASR heard "السراط" instead of "الصراط" — phonetic confusion ص/س
+# Standard matching would score this lower, ASR mode recognizes
+# it as a known phonetic confusion and scores it higher.
+result = validator.validate("يا ايها الذين امنوا اتقوا الله حق تقاته ولا تموتن الا وانتم مسلمون")
+print(result.is_valid)    # True
+print(result.reference)   # "3:102"
+```
+
+ASR mode also handles:
+- **Stutter removal**: "قل قل هو الله" → "قل هو الله"
+- **Function word drops**: Lower penalty when ASR drops و, في, من, etc.
+- **Word boundary fixes**: Removes zero-width characters, collapses spaces
+
+### Streaming Scanner (Cross-Chunk Verse Detection)
+
+For real-time ASR pipelines where text arrives in chunks, a Quranic verse may be split across two chunks. The `StreamingScanner` maintains state across chunks to detect these split verses:
+
+```python
+from ijaza import StreamingScanner, StreamingScannerOptions
+from ijaza.translations import TranslationProvider
+
+provider = TranslationProvider()
+scanner = StreamingScanner(
+    options=StreamingScannerOptions(
+        overlap_words=15,
+        min_confidence=0.85,
+        asr_tolerant=True,
+    ),
+    translation_provider=provider,
+)
+
+# Process chunks as they arrive from ASR
+for chunk in asr_stream:
+    result = scanner.process_chunk(chunk.text)
+
+    for verse in result.complete_verses:
+        print(f"Found: {verse.reference} — {verse.correct_text}")
+        print(f"English: {verse.translations.get('en', '')}")
+
+    if result.partial_verse:
+        print("Verse in progress, waiting for next chunk...")
+
+# End of stream — flush remaining
+final = scanner.flush()
+scanner.reset()
+```
+
+For batch processing (non-streaming), use `scan_for_verses()`:
+
+```python
+from ijaza import QuranValidator
+
+validator = QuranValidator()
+
+text = "والصلاة والسلام على رسوله قل هو الله احد الله الصمد لم يلد ولم يولد ولم يكن له كفوا احد وهذا يدل على التوحيد"
+results = validator.scan_for_verses(text, min_words=3, confidence_threshold=0.85)
+
+for v in results:
+    print(f"{v['reference']}: {v['correct_text']}")
+```
+
+### Trusted Translations
+
+When a Quranic verse is detected, ijaza can attach authoritative scholarly translations from bundled data — never LLM-generated:
+
+```python
+from ijaza import QuranValidator
+from ijaza.translations import TranslationProvider
+
+provider = TranslationProvider()  # loads Sahih International + Bubenheim
+validator = QuranValidator(translation_provider=provider)
+
+result = validator.validate("بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ")
+print(result.translations['en'])  # "In the name of Allah, the Entirely Merciful, the Especially Merciful."
+print(result.translations['de'])  # "Im Namen Allahs, des Allerbarmers, des Barmherzigen."
+```
+
+Default editions: **Sahih International** (English) and **Bubenheim & Elyas** (German). To use different editions:
+
+```python
+from ijaza.translations import TranslationProvider, TranslationConfig
+
+# Use Pickthall for English instead
+provider = TranslationProvider(TranslationConfig(
+    editions={'en': 'en.pickthall', 'de': 'de.bubenheim'}
+))
+```
+
+Fetch additional translation editions:
+
+```bash
+python scripts/fetch_translations.py --editions en.yusufali de.aburida
+python scripts/fetch_translations.py --list-editions  # show all available
+```
+
+Available editions: `en.sahih`, `en.pickthall`, `en.yusufali`, `en.asad`, `en.hilali`, `en.itani`, `de.bubenheim`, `de.aburida`, `de.khoury`, `de.zaidan`.
+
+Translations also work with `LLMProcessor` and `StreamingScanner` — pass the `translation_provider` to any of them.
+
 ### Arabic Normalization Utilities
 
 ```python
@@ -148,6 +256,9 @@ has_arabic = contains_arabic("Hello مرحبا")  # True
 - **Auto-correction**: Fixes misquoted verses automatically
 - **Detection**: Finds untagged Quran quotes in text
 - **Full database**: 6,236 verses with Uthmani script
+- **ASR error tolerance**: Phonetic-aware matching for speech recognition errors (ص/س, ط/ت, etc.)
+- **Streaming scanner**: Cross-chunk verse detection for real-time ASR pipelines
+- **Trusted translations**: Bundled English (Sahih International) and German (Bubenheim & Elyas) translations from scholarly sources
 - **Zero dependencies**: Pure Python implementation (optional `rapidfuzz` for performance)
 
 
@@ -157,19 +268,27 @@ has_arabic = contains_arabic("Hello مرحبا")  # True
 
 ```python
 from ijaza import QuranValidator, ValidatorOptions
+from ijaza.translations import TranslationProvider
 
 # With custom options
-validator = QuranValidator(ValidatorOptions(
-    fuzzy_threshold=0.85,
-    max_suggestions=5,
-    include_partial=True,
-))
+validator = QuranValidator(
+    options=ValidatorOptions(
+        fuzzy_threshold=0.85,
+        max_suggestions=5,
+        include_partial=True,
+        asr_tolerant=False,  # set True for ASR input
+    ),
+    translation_provider=TranslationProvider(),  # optional
+)
 
 # Validate text
 result = validator.validate("Arabic text here")
 
 # Detect and validate all quotes in text
 detection = validator.detect_and_validate("Text with Quran quotes...")
+
+# Scan continuous Arabic text for embedded verses (sliding window)
+found = validator.scan_for_verses("long arabic text...", min_words=3, confidence_threshold=0.85)
 
 # Get specific verse
 verse = validator.get_verse(surah=1, ayah=1)
@@ -185,19 +304,93 @@ results = validator.search("search query", limit=10)
 
 ```python
 from ijaza import LLMProcessor, LLMProcessorOptions
+from ijaza.translations import TranslationProvider
 
-processor = LLMProcessor(LLMProcessorOptions(
-    auto_correct=True,
-    min_confidence=0.85,
-    scan_untagged=True,
-    tag_format='xml',  # or 'markdown', 'bracket'
-))
+processor = LLMProcessor(
+    options=LLMProcessorOptions(
+        auto_correct=True,
+        min_confidence=0.85,
+        scan_untagged=True,
+        tag_format='xml',  # or 'markdown', 'bracket'
+    ),
+    translation_provider=TranslationProvider(),  # optional
+)
 
 # Get system prompt for your LLM
 prompt = processor.get_system_prompt()
 
 # Process LLM output
 result = processor.process(llm_output)
+
+# Translations are attached to each detected quote
+for quote in result.quotes:
+    print(quote.translations)  # {'en': '...', 'de': '...'}
+```
+
+### StreamingScanner
+
+```python
+from ijaza import StreamingScanner, StreamingScannerOptions
+from ijaza.translations import TranslationProvider
+
+scanner = StreamingScanner(
+    options=StreamingScannerOptions(
+        overlap_words=10,        # words retained between chunks
+        min_confidence=0.85,
+        min_words=3,
+        max_words=50,
+        max_chunk_span=3,        # max chunks a partial can span
+        asr_tolerant=True,
+    ),
+    translation_provider=TranslationProvider(),  # optional
+)
+
+result = scanner.process_chunk("text chunk...")
+# result.complete_verses — fully detected verses
+# result.partial_verse — verse in progress at chunk boundary
+
+final = scanner.flush()   # emit remaining at end of stream
+scanner.reset()           # reset for new stream
+```
+
+### TranslationProvider
+
+```python
+from ijaza.translations import TranslationProvider, TranslationConfig, TRUSTED_EDITIONS
+
+# Default: Sahih International (en) + Bubenheim (de)
+provider = TranslationProvider()
+
+# Custom editions
+provider = TranslationProvider(TranslationConfig(
+    editions={'en': 'en.pickthall', 'de': 'de.aburida'}
+))
+
+# Look up translations
+en = provider.get_translation(surah=1, ayah=1, lang='en')
+all_langs = provider.get_translations(surah=1, ayah=1)  # {'en': '...', 'de': '...'}
+
+# Check availability
+print(TRUSTED_EDITIONS)  # all known edition identifiers
+provider.is_edition_available('en.sahih')  # True
+```
+
+### ASR Tolerance Utilities
+
+```python
+from ijaza.asr_tolerance import (
+    calculate_asr_similarity,    # phonetic-aware string similarity
+    preprocess_asr_text,         # stutter removal + boundary fixes
+    get_substitution_cost,       # cost for a single char pair
+    PHONETIC_CONFUSIONS,         # list of (char_a, char_b, cost) tuples
+    FUNCTION_WORDS,              # set of Arabic particles ASR drops
+)
+
+# Phonetic-aware similarity (ص and س cost only 0.3 instead of 1.0)
+sim = calculate_asr_similarity("الصراط", "السراط")  # ~0.95
+
+# Preprocess ASR output
+clean = preprocess_asr_text("قل قل هو  الله")  # "قل هو الله"
 ```
 
 ### Normalization Utilities
@@ -229,9 +422,6 @@ similarity = calculate_similarity("text1", "text2")  # 0.0 - 1.0
 
 ## Future Work
 
-### Translation Validation
-Include major English translations (Sahih International, Pickthall, Yusuf Ali) and validate that translations correspond to the correct Arabic source verse.
-
 ### Framework Integrations
 - LangChain / LlamaIndex guardrails
 - FastAPI middleware
@@ -239,9 +429,8 @@ Include major English translations (Sahih International, Pickthall, Yusuf Ali) a
 - Django/Flask integration
 
 ### Performance Optimizations
-- N-gram indexing for pre-filtering
+- N-gram indexing for pre-filtering candidates (faster `scan_for_verses`)
 - BK-tree for metric-space nearest-neighbor search
-- Async/streaming support for real-time pipelines
 
 ## Contributing
 

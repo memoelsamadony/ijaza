@@ -65,7 +65,7 @@ packages = ["ijaza"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-"ijaza" = ["data/*.json", "py.typed"]
+"ijaza" = ["data/*.json", "data/translations/*.json", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
