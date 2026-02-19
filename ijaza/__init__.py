@@ -70,6 +70,31 @@ from .llm_integration import (
     LLMProcessorOptions,
 )
 
+# ASR tolerance
+from .asr_tolerance import (
+    ASROptions,
+    calculate_asr_similarity,
+    preprocess_asr_text,
+    PHONETIC_CONFUSIONS,
+)
+
+# Streaming scanner
+from .streaming import (
+    StreamingScanner,
+    StreamingResult,
+    StreamingScannerOptions,
+    ScannedVerse,
+    PartialVerse,
+)
+
+# Translations
+from .translations import (
+    TranslationProvider,
+    TranslationConfig,
+    TranslationVerse,
+    TRUSTED_EDITIONS,
+)
+
 __version__ = "1.0.0"
 __author__ = "Yazin Alirhayim"
 __license__ = "MIT"
@@ -105,4 +130,20 @@ __all__ = [
     "ProcessedOutput",
     "QuoteAnalysis",
     "LLMProcessorOptions",
+    # ASR tolerance
+    "ASROptions",
+    "calculate_asr_similarity",
+    "preprocess_asr_text",
+    "PHONETIC_CONFUSIONS",
+    # Streaming scanner
+    "StreamingScanner",
+    "StreamingResult",
+    "StreamingScannerOptions",
+    "ScannedVerse",
+    "PartialVerse",
+    # Translations
+    "TranslationProvider",
+    "TranslationConfig",
+    "TranslationVerse",
+    "TRUSTED_EDITIONS",
 ]
