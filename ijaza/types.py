@@ -91,6 +91,9 @@ class ValidationResult:
     differences: list[Difference] = field(default_factory=list)
     # Suggestions if multiple possible matches exist
     suggestions: list[Suggestion] = field(default_factory=list)
+    # Translations (only populated when a TranslationProvider is configured)
+    # e.g., {'en': 'In the name of Allah...', 'de': 'Im Namen Allahs...'}
+    translations: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -129,6 +132,8 @@ class ValidatorOptions:
     include_partial: bool = True
     # Minimum text length to consider for detection (default: 10)
     min_detection_length: int = 10
+    # Enable ASR error tolerance for fuzzy matching (default: False)
+    asr_tolerant: bool = False
 
 
 @dataclass

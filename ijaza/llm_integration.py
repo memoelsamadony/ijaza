@@ -7,12 +7,17 @@ Provides tools for integrating Quran validation into LLM pipelines:
 3. Scanners that detect untagged potential Quran content
 """
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from .validator import QuranValidator
 from .normalizer import normalize_arabic, calculate_similarity
+
+if TYPE_CHECKING:
+    from .translations import TranslationProvider
 
 
 @dataclass
@@ -36,6 +41,8 @@ class QuoteAnalysis:
     end_index: int
     # Whether correction was applied
     was_corrected: bool
+    # Translations (only populated when a TranslationProvider is configured)
+    translations: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -220,14 +227,20 @@ class LLMProcessor:
         >>> print(result.corrected_text)
     """
 
-    def __init__(self, options: Optional[LLMProcessorOptions] = None):
+    def __init__(
+        self,
+        options: Optional[LLMProcessorOptions] = None,
+        translation_provider: Optional[TranslationProvider] = None,
+    ):
         """
         Initialize the LLMProcessor.
 
         Args:
             options: Processor options (uses defaults if not provided)
+            translation_provider: Optional provider for verse translations
         """
-        self.validator = QuranValidator()
+        self.validator = QuranValidator(translation_provider=translation_provider)
+        self._translation_provider = translation_provider
 
         if options is None:
             self.options = LLMProcessorOptions()
@@ -510,6 +523,13 @@ class LLMProcessor:
             corrected = validation.matched_verse.text
             was_corrected = True
 
+        # Attach translations if available
+        translations: dict[str, str] = {}
+        if self._translation_provider and validation.matched_verse:
+            translations = self._translation_provider.get_translations(
+                validation.matched_verse.surah, validation.matched_verse.ayah
+            )
+
         return QuoteAnalysis(
             original=text,
             corrected=corrected,
@@ -520,6 +540,7 @@ class LLMProcessor:
             start_index=start_index,
             end_index=end_index,
             was_corrected=was_corrected,
+            translations=translations,
         )
 
     def _analyze_range_quote(
@@ -580,6 +601,14 @@ class LLMProcessor:
             corrected = range_result['text']
             was_corrected = True
 
+        # Attach translations for the first verse in the range
+        translations: dict[str, str] = {}
+        if self._translation_provider and range_result.get('verses'):
+            first_verse = range_result['verses'][0]
+            translations = self._translation_provider.get_translations(
+                first_verse.surah, first_verse.ayah
+            )
+
         return QuoteAnalysis(
             original=text,
             corrected=corrected,
@@ -590,6 +619,7 @@ class LLMProcessor:
             start_index=start_index,
             end_index=end_index,
             was_corrected=was_corrected,
+            translations=translations,
         )
 
     def _format_corrected_tag(self, analysis: QuoteAnalysis) -> str:

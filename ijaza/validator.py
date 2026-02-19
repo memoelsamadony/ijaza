@@ -5,10 +5,15 @@ This module provides the main QuranValidator class for validating
 Arabic text against the authentic Quran database.
 """
 
+from __future__ import annotations
+
 import json
 from importlib import resources
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .translations import TranslationProvider
 
 from .types import (
     QuranVerse,
@@ -26,6 +31,11 @@ from .normalizer import (
     extract_arabic_segments,
     calculate_similarity,
     find_differences,
+)
+from .asr_tolerance import (
+    calculate_asr_similarity,
+    word_level_similarity,
+    preprocess_asr_text,
 )
 
 
@@ -112,17 +122,24 @@ class QuranValidator:
         ...     print(segment.text, segment.validation.is_valid if segment.validation else None)
     """
 
-    def __init__(self, options: Optional[ValidatorOptions] = None):
+    def __init__(
+        self,
+        options: Optional[ValidatorOptions] = None,
+        translation_provider: Optional['TranslationProvider'] = None,
+    ):
         """
         Initialize the QuranValidator.
 
         Args:
             options: Validator options (uses defaults if not provided)
+            translation_provider: Optional provider for verse translations
         """
         if options is None:
             self.options = ValidatorOptions()
         else:
             self.options = options
+
+        self._translation_provider = translation_provider
 
         # Load verses and surahs from bundled data
         verses_data = _load_json_data('quran-verses.json')
@@ -166,6 +183,10 @@ class QuranValidator:
         # Early exit if not Arabic
         if not contains_arabic(trimmed_text):
             return self._no_match()
+
+        # ASR preprocessing (stutter removal, word boundary fixes)
+        if self.options.asr_tolerant:
+            trimmed_text = preprocess_asr_text(trimmed_text)
 
         # Step 1: Try exact match (with diacritics)
         exact_match = self._find_exact_match(trimmed_text)
@@ -386,6 +407,77 @@ class QuranValidator:
 
         return results[:limit]
 
+    def scan_for_verses(
+        self,
+        text: str,
+        min_words: int = 3,
+        max_words: int = 50,
+        confidence_threshold: float = 0.85,
+    ) -> list[dict]:
+        """
+        Scan continuous Arabic text for Quranic verses using a sliding window.
+
+        Unlike validate() which checks if the entire input is a verse,
+        this method finds verses embedded within longer Arabic text.
+
+        Args:
+            text: Arabic text to scan
+            min_words: Minimum word count for a potential verse
+            max_words: Maximum word count in the sliding window
+            confidence_threshold: Minimum similarity to report
+
+        Returns:
+            List of dicts with 'original_text', 'correct_text', 'reference',
+            'confidence', 'start_pos', 'end_pos', 'verses', 'needs_correction',
+            'translations'
+        """
+        words = text.split()
+        results: list[dict] = []
+        covered: set[int] = set()
+
+        for start in range(len(words)):
+            if start in covered:
+                continue
+
+            best_match = None
+            best_end = start
+            best_confidence = 0.0
+
+            for end in range(
+                start + min_words,
+                min(start + max_words + 1, len(words) + 1),
+            ):
+                window = ' '.join(words[start:end])
+                result = self.validate(window)
+
+                if result.is_valid and result.confidence > best_confidence:
+                    best_confidence = result.confidence
+                    best_match = result
+                    best_end = end
+
+            if best_match and best_confidence >= confidence_threshold:
+                verse = best_match.matched_verse
+                # Calculate character positions
+                start_char = len(' '.join(words[:start])) + (1 if start > 0 else 0)
+                end_char = start_char + len(' '.join(words[start:best_end]))
+
+                results.append({
+                    'original_text': ' '.join(words[start:best_end]),
+                    'correct_text': verse.text if verse else '',
+                    'reference': best_match.reference or '',
+                    'confidence': best_confidence,
+                    'start_pos': start_char,
+                    'end_pos': end_char,
+                    'verses': [verse] if verse else [],
+                    'needs_correction': best_match.match_type != 'exact',
+                    'translations': best_match.translations,
+                })
+
+                for pos in range(start, best_end):
+                    covered.add(pos)
+
+        return results
+
     # Private helper methods
 
     def _find_exact_match(self, text: str) -> Optional[QuranVerse]:
@@ -454,6 +546,18 @@ class QuranValidator:
     ) -> float:
         """Calculate similarity between input and verse."""
         normalized_verse = normalize_arabic(verse.text)
+
+        if self.options.asr_tolerant:
+            # Character-level phonetic-aware similarity
+            char_sim = calculate_asr_similarity(normalized_input, normalized_verse)
+
+            # Word-level similarity (catches dropped function words)
+            input_words = normalized_input.split()
+            verse_words = normalized_verse.split()
+            word_sim = word_level_similarity(input_words, verse_words)
+
+            return max(char_sim, word_sim)
+
         return calculate_similarity(normalized_input, normalized_verse)
 
     def _create_result(
@@ -463,12 +567,19 @@ class QuranValidator:
         confidence: float
     ) -> ValidationResult:
         """Create a successful validation result."""
+        translations: dict[str, str] = {}
+        if self._translation_provider:
+            translations = self._translation_provider.get_translations(
+                verse.surah, verse.ayah
+            )
+
         return ValidationResult(
             is_valid=True,
             match_type=match_type,
             confidence=confidence,
             matched_verse=verse,
             reference=f"{verse.surah}:{verse.ayah}",
+            translations=translations,
         )
 
     def _no_match(self) -> ValidationResult:
