@@ -95,8 +95,8 @@ from .translations import (
     TRUSTED_EDITIONS,
 )
 
-__version__ = "1.1.0"
-__author__ = "Yazin Alirhayim"
+__version__ = "1.2.0"
+__author__ = "Mahmoud_Elsamadony"
 __license__ = "MIT"
 
 __all__ = [
