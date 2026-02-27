@@ -8,6 +8,7 @@ from scratch with many sliding windows.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -34,7 +35,10 @@ class StreamingQuranMatcherOptions:
     anchor_ngram_sizes: tuple[int, ...] = (3, 2)
     beam_size: int = 48
     max_verifications_per_chunk: int = 64
+    extra_verifications_dense: int = 192
     max_full_validations_per_chunk: int = 8
+    extra_full_validations_dense: int = 12
+    dense_active_ratio: float = 0.70
     max_emit_window_candidates: int = 8
     min_anchor_score: float = 2.0
     # Candidate gate for the fast verifier before final validation.
@@ -45,6 +49,16 @@ class StreamingQuranMatcherOptions:
     # Candidate window expansion around anchored verse start/length
     max_start_delta: int = 2
     max_len_delta: int = 3
+    adaptive_expand_coverage_threshold: float = 0.35
+    adaptive_expand_support_threshold: float = 0.70
+    adaptive_extra_start_delta: int = 2
+    adaptive_extra_len_delta: int = 3
+    adaptive_min_approx_drop: float = 0.10
+
+    # Fuzzy emission guard to reduce false positives.
+    short_verse_words: int = 8
+    min_fuzzy_lexical_overlap: float = 0.45
+    min_fuzzy_lexical_overlap_short: float = 0.56
 
     # State retention
     max_buffer_words: int = 96
@@ -106,6 +120,9 @@ class _ApproxMatch:
     end_local: int
     approx_confidence: float
     match_type: str
+    lexical_overlap: float = 0.0
+    anchor_mass_ratio: float = 0.0
+    chain_coverage: float = 0.0
 
 
 @dataclass
@@ -305,11 +322,19 @@ class StreamingQuranMatcher:
         emitted: list[StreamingQuranHit] = []
         emitted_refs_this_pass: set[str] = set()
         verified_count = 0
+        verification_cap = self.options.max_verifications_per_chunk
         full_validated_count = 0
+        full_validation_cap = self.options.max_full_validations_per_chunk
+        if len(self._active) >= max(1, int(self.options.beam_size * self.options.dense_active_ratio)):
+            verification_cap += self.options.extra_verifications_dense
+            full_validation_cap += self.options.extra_full_validations_dense
+        if flush:
+            verification_cap += max(8, self.options.extra_verifications_dense // 4)
+            full_validation_cap += max(2, self.options.extra_full_validations_dense // 2)
         checked_spans: set[tuple[int, int, int]] = set()
 
         for h in ranked:
-            if verified_count >= self.options.max_verifications_per_chunk:
+            if verified_count >= verification_cap:
                 break
             if h.last_verified_chunk == self._chunk_index and not flush:
                 continue
@@ -327,17 +352,40 @@ class StreamingQuranMatcher:
                 continue
 
             candidate_matches: list[_ApproxMatch] = []
+            uncertain_chain = (
+                chain.coverage_ratio < self.options.adaptive_expand_coverage_threshold
+                or chain.support_ratio < self.options.adaptive_expand_support_threshold
+            )
+            start_delta_max = self.options.max_start_delta
+            len_delta_max = self.options.max_len_delta
+            local_min_approx = self.options.min_approx_confidence
+            if uncertain_chain:
+                start_delta_max += self.options.adaptive_extra_start_delta
+                len_delta_max += self.options.adaptive_extra_len_delta
+                local_min_approx = max(
+                    0.45,
+                    self.options.min_approx_confidence - self.options.adaptive_min_approx_drop,
+                )
+            if verse_wc <= self.options.short_verse_words:
+                local_min_approx = min(
+                    local_min_approx,
+                    max(0.52, self.options.min_approx_confidence - 0.14),
+                )
 
-            start_deltas = range(-self.options.max_start_delta, self.options.max_start_delta + 1)
-            len_deltas = range(-self.options.max_len_delta, self.options.max_len_delta + 1)
+            start_deltas = range(-start_delta_max, start_delta_max + 1)
+            len_deltas = range(-len_delta_max, len_delta_max + 1)
 
             for start_delta in start_deltas:
+                if verified_count >= verification_cap:
+                    break
                 start_global = chain.est_start_global + start_delta
                 start_local = start_global - self._buffer_start_token
                 if start_local < 0 or start_local >= len(self._buffer_words):
                     continue
 
                 for len_delta in len_deltas:
+                    if verified_count >= verification_cap:
+                        break
                     candidate_len = verse_wc + chain.span_len_bias + len_delta
                     if candidate_len < self.options.min_words or candidate_len > self.options.max_words:
                         continue
@@ -365,31 +413,28 @@ class StreamingQuranMatcher:
                         start_global=start_global,
                         end_global=end_global,
                     )
-                    if approx is None or approx.approx_confidence < self.options.min_approx_confidence:
+                    if approx is None or approx.approx_confidence < local_min_approx:
                         continue
 
-                    candidate_matches.append(_ApproxMatch(
-                        start_local=start_local,
-                        end_local=end_local,
-                        approx_confidence=approx.approx_confidence,
-                        match_type=approx.match_type,
-                    ))
+                    candidate_matches.append(approx)
 
             h.last_verified_chunk = self._chunk_index
             if candidate_matches:
-                candidate_matches.sort(
-                    key=lambda m: (
-                        -m.approx_confidence,
-                        -(m.end_local - m.start_local),
-                        m.start_local,
-                    )
-                )
                 h.best_confidence = max(
                     h.best_confidence,
                     max(m.approx_confidence for m in candidate_matches),
                 )
 
-                for match in candidate_matches[:self.options.max_emit_window_candidates]:
+                verse_tokens = tuple(self.validator._normalized_verse_words_by_id.get(h.verse_id, ()))
+                if not verse_tokens:
+                    verse_tokens = tuple(_normalize_scan_token(w) for w in verse.text.split())
+
+                selected_candidates = self._select_emit_candidates(
+                    candidate_matches,
+                    limit=self.options.max_emit_window_candidates,
+                )
+
+                for match in selected_candidates:
                     start_local = match.start_local
                     end_local = match.end_local
                     start_global = self._buffer_start_token + start_local
@@ -402,7 +447,7 @@ class StreamingQuranMatcher:
 
                     # Finalize with full validator only for emitted matches to keep
                     # per-candidate verification cheap.
-                    if full_validated_count >= self.options.max_full_validations_per_chunk and not flush:
+                    if full_validated_count >= full_validation_cap:
                         break
 
                     window_text = " ".join(self._buffer_words[start_local:end_local])
@@ -410,6 +455,16 @@ class StreamingQuranMatcher:
                     full_validated_count += 1
                     if not result.is_valid or result.confidence < self.options.min_confidence:
                         continue
+
+                    if result.match_type == "fuzzy":
+                        window_norm = tuple(self._buffer_norm_words[start_local:end_local])
+                        lexical_overlap = self._token_multiset_overlap_ratio(window_norm, verse_tokens)
+                        min_overlap = self._min_required_fuzzy_overlap(
+                            verse_words=len(verse_tokens),
+                            confidence=result.confidence,
+                        )
+                        if lexical_overlap < min_overlap:
+                            continue
 
                     ref = result.reference or ""
                     if not flush and ref and ref in emitted_refs_this_pass:
@@ -678,7 +733,94 @@ class StreamingQuranMatcher:
             end_local=end_local,
             approx_confidence=confidence,
             match_type="anchor-chain",
+            lexical_overlap=coverage_ratio,
+            anchor_mass_ratio=mass_ratio,
+            chain_coverage=chain.coverage_ratio,
         )
+
+    @staticmethod
+    def _token_multiset_overlap_ratio(
+        input_tokens: tuple[str, ...],
+        verse_tokens: tuple[str, ...],
+    ) -> float:
+        """Multiset token overlap normalized by verse length."""
+        if not input_tokens or not verse_tokens:
+            return 0.0
+
+        input_counts = Counter(input_tokens)
+        verse_counts = Counter(verse_tokens)
+        overlap = 0
+        for token, v_count in verse_counts.items():
+            overlap += min(v_count, input_counts.get(token, 0))
+        return overlap / max(1, len(verse_tokens))
+
+    def _min_required_fuzzy_overlap(self, verse_words: int, confidence: float) -> float:
+        """Adaptive lexical-overlap requirement for fuzzy emits."""
+        if verse_words <= self.options.short_verse_words:
+            base = self.options.min_fuzzy_lexical_overlap_short
+        else:
+            base = self.options.min_fuzzy_lexical_overlap
+
+        # Allow slightly lower overlap for very high-confidence fuzzy matches.
+        confidence_bonus = max(0.0, confidence - self.options.min_confidence) * 0.35
+        return max(0.40, base - confidence_bonus)
+
+    def _select_emit_candidates(
+        self,
+        candidates: list[_ApproxMatch],
+        *,
+        limit: int,
+    ) -> list[_ApproxMatch]:
+        """
+        Choose emit candidates using mixed ranking.
+
+        Mixes top-by-confidence and top-by-lexical/anchor evidence to reduce
+        misses when one scoring dimension over-favors truncated spans.
+        """
+        if not candidates or limit <= 0:
+            return []
+
+        conf_ranked = sorted(
+            candidates,
+            key=lambda m: (
+                -m.approx_confidence,
+                -(m.end_local - m.start_local),
+                m.start_local,
+            ),
+        )
+        lex_ranked = sorted(
+            candidates,
+            key=lambda m: (
+                -m.lexical_overlap,
+                -m.anchor_mass_ratio,
+                -m.chain_coverage,
+                -m.approx_confidence,
+                -(m.end_local - m.start_local),
+            ),
+        )
+
+        selected: list[_ApproxMatch] = []
+        seen: set[tuple[int, int]] = set()
+        i = 0
+        j = 0
+        while len(selected) < limit and (i < len(conf_ranked) or j < len(lex_ranked)):
+            if i < len(conf_ranked):
+                c = conf_ranked[i]
+                i += 1
+                key = (c.start_local, c.end_local)
+                if key not in seen:
+                    selected.append(c)
+                    seen.add(key)
+                    if len(selected) >= limit:
+                        break
+            if j < len(lex_ranked):
+                c = lex_ranked[j]
+                j += 1
+                key = (c.start_local, c.end_local)
+                if key not in seen:
+                    selected.append(c)
+                    seen.add(key)
+        return selected
 
     def _is_duplicate_reference_span(
         self,
