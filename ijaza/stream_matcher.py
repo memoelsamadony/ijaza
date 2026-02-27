@@ -34,6 +34,9 @@ class StreamingQuranMatcherOptions:
     # Anchor search
     anchor_ngram_sizes: tuple[int, ...] = (3, 2)
     beam_size: int = 48
+    max_hypotheses_per_verse: int = 4
+    max_hypotheses_per_start_bucket: int = 3
+    start_bucket_words: int = 6
     max_verifications_per_chunk: int = 64
     extra_verifications_dense: int = 192
     max_full_validations_per_chunk: int = 8
@@ -59,6 +62,20 @@ class StreamingQuranMatcherOptions:
     short_verse_words: int = 8
     min_fuzzy_lexical_overlap: float = 0.45
     min_fuzzy_lexical_overlap_short: float = 0.56
+    defer_fuzzy_emit_confidence: float = 0.90
+    pending_confirmation_hits: int = 2
+    pending_max_chunk_gap: int = 2
+    end_chunk_adjacent_validations: int = 2
+
+    # Optional bounded rescue scan:
+    # run indexed scanner on a short rolling tail when stream path produced no emit.
+    rescue_reanchor_enabled: bool = False
+    rescue_only_when_no_emit: bool = True
+    rescue_window_words: int = 72
+    rescue_max_emits_per_scan: int = 2
+    rescue_min_chunk_gap: int = 2
+    rescue_min_confidence: float = 0.84
+    rescue_max_active_hypotheses: int = 40
 
     # State retention
     max_buffer_words: int = 96
@@ -143,6 +160,24 @@ class _ChainSummary:
     diag_max: int
 
 
+@dataclass
+class _PendingEmit:
+    """Deferred fuzzy emission candidate waiting for reconfirmation."""
+
+    reference: str
+    start_token: int
+    end_token: int
+    confidence: float
+    original_text: str
+    correct_text: str
+    translations: dict[str, str]
+    needs_correction: bool
+    created_chunk: int
+    last_seen_chunk: int
+    seen_count: int
+    verse: Optional[QuranVerse] = None
+
+
 class StreamingQuranMatcher:
     """
     Experimental online matcher for Quran verses in ASR chunks.
@@ -182,6 +217,8 @@ class StreamingQuranMatcher:
         self._active: dict[tuple[int, int], ActiveHypothesis] = {}
         self._emitted_keys: set[tuple[str, int]] = set()
         self._emitted_spans_by_ref: dict[str, list[tuple[int, int]]] = {}
+        self._pending_by_ref: dict[str, _PendingEmit] = {}
+        self._last_rescue_chunk: int = -10_000
 
     def process_chunk(self, text: str) -> StreamingQuranMatcherResult:
         """Process one ASR chunk and emit complete verse matches."""
@@ -197,6 +234,21 @@ class StreamingQuranMatcher:
 
         self._seed_hypotheses_from_new_words(before_len, len(self._buffer_words))
         complete_hits, stats = self._verify_hypotheses(flush=False)
+        rescue_scans = 0
+        rescue_emitted = 0
+        if self._should_run_rescue_scan(emitted_count=len(complete_hits)):
+            rescue_scans = 1
+            refs_this_pass = {h.reference for h in complete_hits if h.reference}
+            rescue_hits = self._run_rescue_reanchor_scan(
+                chunk_words=chunk_words,
+                chunk_start_local=before_len,
+                emitted_refs_this_pass=refs_this_pass,
+            )
+            if rescue_hits:
+                rescue_emitted = len(rescue_hits)
+                complete_hits.extend(rescue_hits)
+        stats["rescue_scans"] = rescue_scans
+        stats["rescue_emitted"] = rescue_emitted
         self._prune_hypotheses()
         self._trim_buffer()
 
@@ -229,6 +281,8 @@ class StreamingQuranMatcher:
         self._active = {}
         self._emitted_keys = set()
         self._emitted_spans_by_ref = {}
+        self._pending_by_ref = {}
+        self._last_rescue_chunk = -10_000
 
     def _seed_hypotheses_from_new_words(self, new_start_local: int, new_end_local: int) -> None:
         """Seed/update hypotheses using n-grams that touch newly appended words."""
@@ -303,10 +357,10 @@ class StreamingQuranMatcher:
 
         self._stream_token_count = self._buffer_start_token + len(self._buffer_words)
 
-    def _verify_hypotheses(self, *, flush: bool) -> tuple[list[StreamingQuranHit], dict[str, int]]:
-        """Verify top hypotheses against nearby spans and emit complete matches."""
-        if not self._active:
-            return [], {"active": 0, "verified": 0, "full_validated": 0, "emitted": 0}
+    def _rank_active_hypotheses(self, limit: int) -> list[ActiveHypothesis]:
+        """Rank active hypotheses and enforce diversity caps."""
+        if not self._active or limit <= 0:
+            return []
 
         ranked = sorted(
             self._active.values(),
@@ -317,10 +371,211 @@ class StreamingQuranMatcher:
                 h.verse_id,
             ),
         )
-        ranked = ranked[:self.options.beam_size]
+        return self._select_diverse_hypotheses(ranked, limit=limit)
+
+    def _select_diverse_hypotheses(
+        self,
+        ranked: list[ActiveHypothesis],
+        *,
+        limit: int,
+    ) -> list[ActiveHypothesis]:
+        """Select top hypotheses while capping per-verse and start-region crowding."""
+        if not ranked or limit <= 0:
+            return []
+
+        per_verse_cap = max(1, int(self.options.max_hypotheses_per_verse))
+        per_bucket_cap = max(1, int(self.options.max_hypotheses_per_start_bucket))
+        bucket_size = max(1, int(self.options.start_bucket_words))
+
+        selected: list[ActiveHypothesis] = []
+        selected_ids: set[tuple[int, int]] = set()
+        per_verse: dict[int, int] = {}
+        per_bucket: dict[int, int] = {}
+
+        for h in ranked:
+            if len(selected) >= limit:
+                break
+            if per_verse.get(h.verse_id, 0) >= per_verse_cap:
+                continue
+            bucket = h.candidate_start_token // bucket_size
+            if per_bucket.get(bucket, 0) >= per_bucket_cap:
+                continue
+            selected.append(h)
+            selected_ids.add((h.verse_id, h.candidate_start_token))
+            per_verse[h.verse_id] = per_verse.get(h.verse_id, 0) + 1
+            per_bucket[bucket] = per_bucket.get(bucket, 0) + 1
+
+        # Backfill without diversity caps if strict caps underfill the beam.
+        if len(selected) < limit:
+            for h in ranked:
+                if len(selected) >= limit:
+                    break
+                key = (h.verse_id, h.candidate_start_token)
+                if key in selected_ids:
+                    continue
+                selected.append(h)
+                selected_ids.add(key)
+
+        return selected
+
+    def _pending_to_hit(self, pending: _PendingEmit) -> StreamingQuranHit:
+        """Convert deferred candidate state to emitted hit."""
+        verse = pending.verse
+        return StreamingQuranHit(
+            original_text=pending.original_text,
+            start_token=pending.start_token,
+            end_token=pending.end_token,
+            correct_text=verse.text if verse else pending.correct_text,
+            reference=pending.reference,
+            confidence=pending.confidence,
+            verses=[verse] if verse else [],
+            needs_correction=pending.needs_correction,
+            translations=dict(pending.translations),
+        )
+
+    def _drain_pending_emits(self, *, flush: bool) -> list[StreamingQuranHit]:
+        """Expire stale deferred emits and release confirmed ones."""
+        if not self._pending_by_ref:
+            return []
 
         emitted: list[StreamingQuranHit] = []
-        emitted_refs_this_pass: set[str] = set()
+        to_drop: set[str] = set()
+
+        if not flush:
+            for ref, pending in self._pending_by_ref.items():
+                if (self._chunk_index - pending.last_seen_chunk) > self.options.pending_max_chunk_gap:
+                    to_drop.add(ref)
+
+        candidates: list[_PendingEmit] = []
+        for ref, pending in self._pending_by_ref.items():
+            if ref in to_drop:
+                continue
+            if flush:
+                if pending.confidence >= self.options.min_confidence:
+                    candidates.append(pending)
+                continue
+            if pending.seen_count >= self.options.pending_confirmation_hits:
+                candidates.append(pending)
+
+        candidates.sort(
+            key=lambda p: (
+                -p.seen_count,
+                -p.confidence,
+                -p.last_seen_chunk,
+                p.start_token,
+            )
+        )
+
+        for pending in candidates:
+            emit_key = (pending.reference, pending.start_token)
+            if emit_key in self._emitted_keys:
+                to_drop.add(pending.reference)
+                continue
+            if self._is_duplicate_reference_span(
+                pending.reference,
+                pending.start_token,
+                pending.end_token,
+            ):
+                to_drop.add(pending.reference)
+                continue
+
+            self._emitted_keys.add(emit_key)
+            self._record_emitted_reference_span(
+                pending.reference,
+                pending.start_token,
+                pending.end_token,
+            )
+            emitted.append(self._pending_to_hit(pending))
+            to_drop.add(pending.reference)
+
+        for ref in to_drop:
+            self._pending_by_ref.pop(ref, None)
+
+        return emitted
+
+    def _update_pending_emit(
+        self,
+        *,
+        reference: str,
+        start_token: int,
+        end_token: int,
+        result,
+        original_text: str,
+    ) -> Optional[StreamingQuranHit]:
+        """Track low-confidence fuzzy candidate and emit once reconfirmed."""
+        if not reference:
+            return None
+
+        verse_obj = result.matched_verse
+        existing = self._pending_by_ref.get(reference)
+        if existing is None:
+            self._pending_by_ref[reference] = _PendingEmit(
+                reference=reference,
+                start_token=start_token,
+                end_token=end_token,
+                confidence=result.confidence,
+                original_text=original_text,
+                correct_text=verse_obj.text if verse_obj else "",
+                translations=dict(result.translations),
+                needs_correction=(result.match_type != "exact"),
+                created_chunk=self._chunk_index,
+                last_seen_chunk=self._chunk_index,
+                seen_count=1,
+                verse=verse_obj,
+            )
+            return None
+
+        too_old = (self._chunk_index - existing.last_seen_chunk) > self.options.pending_max_chunk_gap
+        overlap = min(end_token, existing.end_token) - max(start_token, existing.start_token)
+        near_start = abs(start_token - existing.start_token) <= self.options.duplicate_ref_window_tokens
+        if too_old or (overlap <= 0 and not near_start):
+            existing.start_token = start_token
+            existing.end_token = end_token
+            existing.confidence = result.confidence
+            existing.original_text = original_text
+            existing.correct_text = verse_obj.text if verse_obj else ""
+            existing.translations = dict(result.translations)
+            existing.needs_correction = (result.match_type != "exact")
+            existing.created_chunk = self._chunk_index
+            existing.last_seen_chunk = self._chunk_index
+            existing.seen_count = 1
+            existing.verse = verse_obj
+            return None
+
+        existing.last_seen_chunk = self._chunk_index
+        existing.seen_count += 1
+        if result.confidence >= existing.confidence:
+            existing.start_token = start_token
+            existing.end_token = end_token
+            existing.confidence = result.confidence
+            existing.original_text = original_text
+            existing.correct_text = verse_obj.text if verse_obj else ""
+            existing.translations = dict(result.translations)
+            existing.needs_correction = (result.match_type != "exact")
+            existing.verse = verse_obj
+
+        if existing.seen_count < self.options.pending_confirmation_hits:
+            return None
+
+        self._pending_by_ref.pop(reference, None)
+        return self._pending_to_hit(existing)
+
+    def _verify_hypotheses(self, *, flush: bool) -> tuple[list[StreamingQuranHit], dict[str, int]]:
+        """Verify top hypotheses against nearby spans and emit complete matches."""
+        if not self._active:
+            pending_emitted = self._drain_pending_emits(flush=flush)
+            return pending_emitted, {
+                "active": 0,
+                "verified": 0,
+                "full_validated": 0,
+                "emitted": len(pending_emitted),
+                "pending": len(self._pending_by_ref),
+            }
+
+        ranked = self._rank_active_hypotheses(self.options.beam_size)
+
+        emitted: list[StreamingQuranHit] = self._drain_pending_emits(flush=flush)
+        emitted_refs_this_pass: set[str] = {h.reference for h in emitted if h.reference}
         verified_count = 0
         verification_cap = self.options.max_verifications_per_chunk
         full_validated_count = 0
@@ -434,6 +689,7 @@ class StreamingQuranMatcher:
                     limit=self.options.max_emit_window_candidates,
                 )
 
+                end_chunk_validations = 0
                 for match in selected_candidates:
                     start_local = match.start_local
                     end_local = match.end_local
@@ -442,8 +698,10 @@ class StreamingQuranMatcher:
                     touches_end = end_local >= len(self._buffer_words)
 
                     if touches_end and not flush and h.chunk_span < self.options.max_chunk_span:
-                        # Keep as partial for next chunk; try a different candidate first.
-                        continue
+                        # Validate only a small number of edge candidates before deferring.
+                        if end_chunk_validations >= self.options.end_chunk_adjacent_validations:
+                            continue
+                        end_chunk_validations += 1
 
                     # Finalize with full validator only for emitted matches to keep
                     # per-candidate verification cheap.
@@ -468,17 +726,49 @@ class StreamingQuranMatcher:
 
                     ref = result.reference or ""
                     if not flush and ref and ref in emitted_refs_this_pass:
-                        break
+                        continue
+
+                    if (
+                        not flush
+                        and ref
+                        and result.match_type == "fuzzy"
+                        and result.confidence < self.options.defer_fuzzy_emit_confidence
+                    ):
+                        pending_hit = self._update_pending_emit(
+                            reference=ref,
+                            start_token=start_global,
+                            end_token=end_global,
+                            result=result,
+                            original_text=window_text,
+                        )
+                        if pending_hit is not None:
+                            emit_key = (pending_hit.reference, pending_hit.start_token)
+                            if emit_key not in self._emitted_keys and not self._is_duplicate_reference_span(
+                                pending_hit.reference,
+                                pending_hit.start_token,
+                                pending_hit.end_token,
+                            ):
+                                self._emitted_keys.add(emit_key)
+                                self._record_emitted_reference_span(
+                                    pending_hit.reference,
+                                    pending_hit.start_token,
+                                    pending_hit.end_token,
+                                )
+                                emitted.append(pending_hit)
+                                emitted_refs_this_pass.add(pending_hit.reference)
+                                self._active.pop((h.verse_id, h.candidate_start_token), None)
+                                break
+                        continue
 
                     emit_key = (ref, start_global)
                     if emit_key in self._emitted_keys:
-                        break
+                        continue
                     if self._is_duplicate_reference_span(
                         ref,
                         start_global,
                         end_global,
                     ):
-                        break
+                        continue
                     self._emitted_keys.add(emit_key)
                     self._record_emitted_reference_span(
                         ref,
@@ -503,6 +793,7 @@ class StreamingQuranMatcher:
 
                     # Prevent repeated detections for the same anchored hypothesis.
                     self._active.pop((h.verse_id, h.candidate_start_token), None)
+                    self._pending_by_ref.pop(ref, None)
                     break
 
         return emitted, {
@@ -510,7 +801,140 @@ class StreamingQuranMatcher:
             "verified": verified_count,
             "full_validated": full_validated_count,
             "emitted": len(emitted),
+            "pending": len(self._pending_by_ref),
         }
+
+    @staticmethod
+    def _word_index_from_char_offset(text: str, char_offset: int) -> int:
+        """Map character offset in space-joined text to a token index."""
+        if char_offset <= 0:
+            return 0
+        if char_offset >= len(text):
+            return text.count(" ") + 1 if text else 0
+        return text[:char_offset].count(" ")
+
+    def _should_run_rescue_scan(self, *, emitted_count: int) -> bool:
+        """Gate expensive rescue scan to keep real-time behavior bounded."""
+        if not self.options.rescue_reanchor_enabled:
+            return False
+        if self.options.rescue_only_when_no_emit and emitted_count > 0:
+            return False
+        if len(self._active) > self.options.rescue_max_active_hypotheses:
+            return False
+        if (self._chunk_index - self._last_rescue_chunk) < self.options.rescue_min_chunk_gap:
+            return False
+        return True
+
+    def _run_rescue_reanchor_scan(
+        self,
+        *,
+        chunk_words: list[str],
+        chunk_start_local: int,
+        emitted_refs_this_pass: set[str],
+    ) -> list[StreamingQuranHit]:
+        """
+        Run a bounded indexed scan on the current chunk to recover missed matches.
+
+        This reuses the validator's indexed scanner (same family as baseline)
+        but keeps invocation bounded by gating/cooldown and per-scan emit caps.
+        """
+        if len(chunk_words) < self.options.min_words:
+            return []
+
+        scan_start_local = chunk_start_local
+        max_words = max(1, int(self.options.rescue_window_words))
+        if len(chunk_words) > max_words:
+            cut = len(chunk_words) - max_words
+            scan_start_local += cut
+            words = chunk_words[cut:]
+        else:
+            words = chunk_words
+        if len(words) < self.options.min_words:
+            return []
+
+        chunk_text = " ".join(words)
+        hits = self.validator.scan_for_verses(
+            chunk_text,
+            min_words=self.options.min_words,
+            max_words=self.options.max_words,
+            confidence_threshold=self.options.rescue_min_confidence,
+        )
+        self._last_rescue_chunk = self._chunk_index
+        if not hits:
+            return []
+
+        # Prefer stronger candidates first to minimize extra emissions.
+        ranked = sorted(
+            hits,
+            key=lambda h: (
+                -float(h.get("confidence", 0.0)),
+                int(h.get("start_pos", 0)),
+                int(h.get("end_pos", 0)),
+            ),
+        )
+
+        emitted: list[StreamingQuranHit] = []
+        for item in ranked:
+            if len(emitted) >= self.options.rescue_max_emits_per_scan:
+                break
+
+            ref = str(item.get("reference", "") or "")
+            if not ref:
+                continue
+            if ref in emitted_refs_this_pass:
+                continue
+
+            conf = float(item.get("confidence", 0.0) or 0.0)
+            if conf < self.options.min_confidence:
+                continue
+
+            start_char = int(item.get("start_pos", 0) or 0)
+            end_char = int(item.get("end_pos", start_char) or start_char)
+            start_word_local = self._word_index_from_char_offset(chunk_text, start_char)
+            end_word_local = self._word_index_from_char_offset(chunk_text, end_char)
+            if end_word_local <= start_word_local:
+                original = str(item.get("original_text", "") or "")
+                span_len_words = len(original.split())
+                if span_len_words <= 0:
+                    continue
+                end_word_local = start_word_local + span_len_words
+            if end_word_local > len(words):
+                end_word_local = len(words)
+            if end_word_local <= start_word_local:
+                continue
+
+            start_global = self._buffer_start_token + scan_start_local + start_word_local
+            end_global = self._buffer_start_token + scan_start_local + end_word_local
+            emit_key = (ref, start_global)
+            if emit_key in self._emitted_keys:
+                continue
+            if self._is_duplicate_reference_span(ref, start_global, end_global):
+                continue
+
+            verses = item.get("verses") or []
+            verse = verses[0] if verses else None
+            original_text = " ".join(words[start_word_local:end_word_local])
+            correct_text = str(item.get("correct_text", "") or "")
+            if not correct_text and verse is not None:
+                correct_text = verse.text
+
+            self._emitted_keys.add(emit_key)
+            self._record_emitted_reference_span(ref, start_global, end_global)
+            emitted_refs_this_pass.add(ref)
+            self._pending_by_ref.pop(ref, None)
+            emitted.append(StreamingQuranHit(
+                original_text=original_text,
+                start_token=start_global,
+                end_token=end_global,
+                correct_text=correct_text,
+                reference=ref,
+                confidence=conf,
+                verses=[verse] if verse else [],
+                needs_correction=bool(item.get("needs_correction", False)),
+                translations=dict(item.get("translations") or {}),
+            ))
+
+        return emitted
 
     def _build_chain_summary(
         self,
@@ -897,14 +1321,17 @@ class StreamingQuranMatcher:
         if len(self._active) <= self.options.beam_size:
             return
 
-        ranked_keys = sorted(
-            self._active.keys(),
-            key=lambda key: (
-                -(self._active[key].anchor_score + self._active[key].best_confidence * 8.0),
-                -self._active[key].last_anchor_token,
+        ranked = sorted(
+            self._active.values(),
+            key=lambda h: (
+                -(h.anchor_score + h.best_confidence * 8.0),
+                -h.last_anchor_token,
+                h.candidate_start_token,
+                h.verse_id,
             ),
         )
-        keep = set(ranked_keys[:self.options.beam_size])
+        selected = self._select_diverse_hypotheses(ranked, limit=self.options.beam_size)
+        keep = {(h.verse_id, h.candidate_start_token) for h in selected}
         for key in list(self._active.keys()):
             if key not in keep:
                 self._active.pop(key, None)
