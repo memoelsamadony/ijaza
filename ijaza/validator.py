@@ -500,63 +500,6 @@ class QuranValidator:
 
     # Private helper methods
 
-    def _scan_for_verses_sliding_window(
-        self,
-        text: str,
-        min_words: int = 3,
-        max_words: int = 50,
-        confidence_threshold: float = 0.85,
-    ) -> list[dict]:
-        """
-        Original exhaustive sliding-window scanner (kept as fallback/reference).
-        """
-        words = text.split()
-        results: list[dict] = []
-        covered: set[int] = set()
-
-        for start in range(len(words)):
-            if start in covered:
-                continue
-
-            best_match = None
-            best_end = start
-            best_confidence = 0.0
-
-            for end in range(
-                start + min_words,
-                min(start + max_words + 1, len(words) + 1),
-            ):
-                window = ' '.join(words[start:end])
-                result = self.validate(window)
-
-                if result.is_valid and result.confidence > best_confidence:
-                    best_confidence = result.confidence
-                    best_match = result
-                    best_end = end
-
-            if best_match and best_confidence >= confidence_threshold:
-                verse = best_match.matched_verse
-                # Calculate character positions
-                start_char = len(' '.join(words[:start])) + (1 if start > 0 else 0)
-                end_char = start_char + len(' '.join(words[start:best_end]))
-
-                results.append({
-                    'original_text': ' '.join(words[start:best_end]),
-                    'correct_text': verse.text if verse else '',
-                    'reference': best_match.reference or '',
-                    'confidence': best_confidence,
-                    'start_pos': start_char,
-                    'end_pos': end_char,
-                    'verses': [verse] if verse else [],
-                    'needs_correction': best_match.match_type != 'exact',
-                    'translations': best_match.translations,
-                })
-
-                for pos in range(start, best_end):
-                    covered.add(pos)
-
-        return results
-
     def _scan_for_verses_indexed(
         self,
         text: str,

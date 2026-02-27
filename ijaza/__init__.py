@@ -87,6 +87,14 @@ from .streaming import (
     PartialVerse,
 )
 
+# Experimental streaming matcher
+from .stream_matcher import (
+    StreamingQuranMatcher,
+    StreamingQuranMatcherOptions,
+    StreamingQuranMatcherResult,
+    StreamingQuranHit,
+)
+
 # Translations
 from .translations import (
     TranslationProvider,
@@ -141,6 +149,11 @@ __all__ = [
     "StreamingScannerOptions",
     "ScannedVerse",
     "PartialVerse",
+    # Experimental streaming matcher
+    "StreamingQuranMatcher",
+    "StreamingQuranMatcherOptions",
+    "StreamingQuranMatcherResult",
+    "StreamingQuranHit",
     # Translations
     "TranslationProvider",
     "TranslationConfig",
