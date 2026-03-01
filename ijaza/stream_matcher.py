@@ -38,7 +38,10 @@ class StreamingQuranMatcherOptions:
     max_hypotheses_per_start_bucket: int = 3
     start_bucket_words: int = 6
     max_verifications_per_chunk: int = 64
-    extra_verifications_dense: int = 192
+    extra_verifications_dense: int = 256
+    # Per-hypothesis verification cap to avoid starving mid-ranked candidates.
+    max_verifications_per_hypothesis: int = 18
+    max_verifications_per_hypothesis_uncertain: int = 30
     max_full_validations_per_chunk: int = 8
     extra_full_validations_dense: int = 12
     dense_active_ratio: float = 0.70
@@ -62,7 +65,24 @@ class StreamingQuranMatcherOptions:
     short_verse_words: int = 8
     min_fuzzy_lexical_overlap: float = 0.45
     min_fuzzy_lexical_overlap_short: float = 0.56
+    # Optional stricter fuzzy gate for very short verses to suppress
+    # semantic-near-miss matches that share only common prefixes.
+    strict_short_verse_mode: bool = False
+    strict_short_verse_words: int = 4
+    strict_short_verse_min_overlap: float = 0.66
+    strict_short_verse_require_edge_tokens: bool = True
+    strict_short_verse_edge_confidence_bypass: float = 0.94
     defer_fuzzy_emit_confidence: float = 0.90
+    # Allow immediate emit for strong one-shot fuzzy matches to reduce
+    # false negatives when the same verse is unlikely to reappear in later chunks.
+    strong_fuzzy_emit_overlap: float = 0.74
+    # Long verses are more prone to high-overlap paraphrase/quote-adjacent noise.
+    # Require stronger lexical overlap for immediate one-shot fuzzy emits.
+    strong_fuzzy_emit_long_verse_words: int = 20
+    strong_fuzzy_emit_overlap_long: float = 0.85
+    strong_fuzzy_emit_approx_confidence: float = 0.84
+    strong_fuzzy_emit_anchor_score: float = 6.0
+    strong_fuzzy_emit_anchor_hits: int = 2
     pending_confirmation_hits: int = 2
     pending_max_chunk_gap: int = 2
     end_chunk_adjacent_validations: int = 2
@@ -175,6 +195,7 @@ class _PendingEmit:
     created_chunk: int
     last_seen_chunk: int
     seen_count: int
+    required_hits: int
     verse: Optional[QuranVerse] = None
 
 
@@ -392,16 +413,36 @@ class StreamingQuranMatcher:
         per_verse: dict[int, int] = {}
         per_bucket: dict[int, int] = {}
 
+        # Seed the beam with one hypothesis per verse first.
+        # This prevents dense clusters from starving low-anchor verses that may
+        # still validate under ASR noise.
+        verse_seed_target = min(limit, max(8, limit // 3))
         for h in ranked:
-            if len(selected) >= limit:
+            if len(selected) >= verse_seed_target:
                 break
-            if per_verse.get(h.verse_id, 0) >= per_verse_cap:
+            if h.verse_id in per_verse:
                 continue
             bucket = h.candidate_start_token // bucket_size
             if per_bucket.get(bucket, 0) >= per_bucket_cap:
                 continue
             selected.append(h)
             selected_ids.add((h.verse_id, h.candidate_start_token))
+            per_verse[h.verse_id] = 1
+            per_bucket[bucket] = per_bucket.get(bucket, 0) + 1
+
+        for h in ranked:
+            if len(selected) >= limit:
+                break
+            key = (h.verse_id, h.candidate_start_token)
+            if key in selected_ids:
+                continue
+            if per_verse.get(h.verse_id, 0) >= per_verse_cap:
+                continue
+            bucket = h.candidate_start_token // bucket_size
+            if per_bucket.get(bucket, 0) >= per_bucket_cap:
+                continue
+            selected.append(h)
+            selected_ids.add(key)
             per_verse[h.verse_id] = per_verse.get(h.verse_id, 0) + 1
             per_bucket[bucket] = per_bucket.get(bucket, 0) + 1
 
@@ -455,6 +496,8 @@ class StreamingQuranMatcher:
                     candidates.append(pending)
                 continue
             if pending.seen_count >= self.options.pending_confirmation_hits:
+                if pending.seen_count < max(1, pending.required_hits):
+                    continue
                 candidates.append(pending)
 
         candidates.sort(
@@ -501,10 +544,16 @@ class StreamingQuranMatcher:
         end_token: int,
         result,
         original_text: str,
+        require_cross_chunk_confirmation: bool = False,
+        required_hits: Optional[int] = None,
     ) -> Optional[StreamingQuranHit]:
         """Track low-confidence fuzzy candidate and emit once reconfirmed."""
         if not reference:
             return None
+        required_hits_eff = max(
+            1,
+            int(required_hits or self.options.pending_confirmation_hits),
+        )
 
         verse_obj = result.matched_verse
         existing = self._pending_by_ref.get(reference)
@@ -521,6 +570,7 @@ class StreamingQuranMatcher:
                 created_chunk=self._chunk_index,
                 last_seen_chunk=self._chunk_index,
                 seen_count=1,
+                required_hits=required_hits_eff,
                 verse=verse_obj,
             )
             return None
@@ -539,11 +589,15 @@ class StreamingQuranMatcher:
             existing.created_chunk = self._chunk_index
             existing.last_seen_chunk = self._chunk_index
             existing.seen_count = 1
+            existing.required_hits = required_hits_eff
             existing.verse = verse_obj
             return None
 
+        same_chunk_repeat = existing.last_seen_chunk == self._chunk_index
         existing.last_seen_chunk = self._chunk_index
-        existing.seen_count += 1
+        if not (require_cross_chunk_confirmation and same_chunk_repeat):
+            existing.seen_count += 1
+        existing.required_hits = max(existing.required_hits, required_hits_eff)
         if result.confidence >= existing.confidence:
             existing.start_token = start_token
             existing.end_token = end_token
@@ -554,7 +608,7 @@ class StreamingQuranMatcher:
             existing.needs_correction = (result.match_type != "exact")
             existing.verse = verse_obj
 
-        if existing.seen_count < self.options.pending_confirmation_hits:
+        if existing.seen_count < max(1, existing.required_hits):
             return None
 
         self._pending_by_ref.pop(reference, None)
@@ -626,12 +680,18 @@ class StreamingQuranMatcher:
                     local_min_approx,
                     max(0.52, self.options.min_approx_confidence - 0.14),
                 )
+            local_verification_cap = self.options.max_verifications_per_hypothesis
+            if uncertain_chain:
+                local_verification_cap = self.options.max_verifications_per_hypothesis_uncertain
+            if flush:
+                local_verification_cap += 6
+            local_verified = 0
 
             start_deltas = range(-start_delta_max, start_delta_max + 1)
             len_deltas = range(-len_delta_max, len_delta_max + 1)
 
             for start_delta in start_deltas:
-                if verified_count >= verification_cap:
+                if verified_count >= verification_cap or local_verified >= local_verification_cap:
                     break
                 start_global = chain.est_start_global + start_delta
                 start_local = start_global - self._buffer_start_token
@@ -639,7 +699,7 @@ class StreamingQuranMatcher:
                     continue
 
                 for len_delta in len_deltas:
-                    if verified_count >= verification_cap:
+                    if verified_count >= verification_cap or local_verified >= local_verification_cap:
                         break
                     candidate_len = verse_wc + chain.span_len_bias + len_delta
                     if candidate_len < self.options.min_words or candidate_len > self.options.max_words:
@@ -662,6 +722,7 @@ class StreamingQuranMatcher:
                     checked_spans.add(span_key)
 
                     verified_count += 1
+                    local_verified += 1
                     approx = self._score_chain_window(
                         chain,
                         verse_wc=verse_wc,
@@ -714,6 +775,7 @@ class StreamingQuranMatcher:
                     if not result.is_valid or result.confidence < self.options.min_confidence:
                         continue
 
+                    strong_fuzzy_emit = False
                     if result.match_type == "fuzzy":
                         window_norm = tuple(self._buffer_norm_words[start_local:end_local])
                         lexical_overlap = self._token_multiset_overlap_ratio(window_norm, verse_tokens)
@@ -723,6 +785,34 @@ class StreamingQuranMatcher:
                         )
                         if lexical_overlap < min_overlap:
                             continue
+                        if (
+                            self.options.strict_short_verse_mode
+                            and len(verse_tokens) <= self.options.strict_short_verse_words
+                        ):
+                            if lexical_overlap < self.options.strict_short_verse_min_overlap:
+                                continue
+                            if (
+                                self.options.strict_short_verse_require_edge_tokens
+                                and result.confidence < self.options.strict_short_verse_edge_confidence_bypass
+                            ):
+                                first_tok = verse_tokens[0] if verse_tokens else ""
+                                last_tok = verse_tokens[-1] if verse_tokens else ""
+                                has_first = first_tok in window_norm if first_tok else True
+                                has_last = last_tok in window_norm if last_tok else True
+                                if not (has_first and has_last):
+                                    continue
+                        strong_overlap_threshold = self.options.strong_fuzzy_emit_overlap
+                        if len(verse_tokens) >= self.options.strong_fuzzy_emit_long_verse_words:
+                            strong_overlap_threshold = max(
+                                strong_overlap_threshold,
+                                self.options.strong_fuzzy_emit_overlap_long,
+                            )
+                        strong_fuzzy_emit = (
+                            lexical_overlap >= strong_overlap_threshold
+                            and match.approx_confidence >= self.options.strong_fuzzy_emit_approx_confidence
+                            and h.anchor_score >= self.options.strong_fuzzy_emit_anchor_score
+                            and h.anchor_hits >= self.options.strong_fuzzy_emit_anchor_hits
+                        )
 
                     ref = result.reference or ""
                     if not flush and ref and ref in emitted_refs_this_pass:
@@ -733,6 +823,7 @@ class StreamingQuranMatcher:
                         and ref
                         and result.match_type == "fuzzy"
                         and result.confidence < self.options.defer_fuzzy_emit_confidence
+                        and not strong_fuzzy_emit
                     ):
                         pending_hit = self._update_pending_emit(
                             reference=ref,
@@ -740,6 +831,14 @@ class StreamingQuranMatcher:
                             end_token=end_global,
                             result=result,
                             original_text=window_text,
+                            require_cross_chunk_confirmation=(
+                                len(verse_tokens) >= self.options.strong_fuzzy_emit_long_verse_words
+                            ),
+                            required_hits=(
+                                max(self.options.pending_confirmation_hits + 1, 3)
+                                if len(verse_tokens) >= self.options.strong_fuzzy_emit_long_verse_words
+                                else self.options.pending_confirmation_hits
+                            ),
                         )
                         if pending_hit is not None:
                             emit_key = (pending_hit.reference, pending_hit.start_token)
