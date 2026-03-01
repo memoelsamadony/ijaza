@@ -26,6 +26,11 @@ if TYPE_CHECKING:
 class StreamingQuranMatcherOptions:
     """Configuration for the experimental streaming matcher."""
 
+    # `stream_v2` keeps the current high-speed hypothesis matcher.
+    # `main_indexed_v1` runs chunk-local indexed scanning compatible with
+    # the pre-stream-matcher main branch behavior.
+    matcher_mode: str = "stream_v2"
+
     min_confidence: float = 0.85
     min_words: int = 3
     max_words: int = 50
@@ -209,6 +214,8 @@ class StreamingQuranMatcher:
     - Verify only a bounded set of candidate spans each chunk
     """
 
+    _SUPPORTED_MODES = ("stream_v2", "main_indexed_v1")
+
     def __init__(
         self,
         options: Optional[StreamingQuranMatcherOptions] = None,
@@ -217,6 +224,11 @@ class StreamingQuranMatcher:
         if options is None:
             options = StreamingQuranMatcherOptions()
         self.options = options
+        if self.options.matcher_mode not in self._SUPPORTED_MODES:
+            raise ValueError(
+                f"Unsupported matcher_mode={self.options.matcher_mode!r}. "
+                f"Expected one of {self._SUPPORTED_MODES}."
+            )
 
         validator_opts = ValidatorOptions(
             fuzzy_threshold=max(0.6, options.min_confidence * 0.9),
@@ -247,6 +259,8 @@ class StreamingQuranMatcher:
         chunk_words = text.split()
         if not chunk_words:
             return StreamingQuranMatcherResult(consumed_text=text)
+        if self.options.matcher_mode == "main_indexed_v1":
+            return self._process_chunk_main_indexed_v1(text=text, chunk_words=chunk_words)
 
         before_len = len(self._buffer_words)
         new_norm_words = [_normalize_scan_token(w) for w in chunk_words]
@@ -282,6 +296,23 @@ class StreamingQuranMatcher:
 
     def flush(self) -> StreamingQuranMatcherResult:
         """Flush any pending hypotheses at end-of-stream."""
+        if self.options.matcher_mode == "main_indexed_v1":
+            result = StreamingQuranMatcherResult(
+                complete_verses=[],
+                partial_hypotheses=0,
+                consumed_text="",
+                stats={
+                    "active": 0,
+                    "verified": 0,
+                    "full_validated": 0,
+                    "emitted": 0,
+                    "pending": 0,
+                    "mode_main_indexed": 1,
+                },
+            )
+            self.reset()
+            return result
+
         complete_hits, stats = self._verify_hypotheses(flush=True)
         result = StreamingQuranMatcherResult(
             complete_verses=complete_hits,
@@ -304,6 +335,82 @@ class StreamingQuranMatcher:
         self._emitted_spans_by_ref = {}
         self._pending_by_ref = {}
         self._last_rescue_chunk = -10_000
+
+    def _process_chunk_main_indexed_v1(
+        self,
+        *,
+        text: str,
+        chunk_words: list[str],
+    ) -> StreamingQuranMatcherResult:
+        """
+        Compatibility mode: chunk-local indexed scan (main v1 behavior).
+
+        This path intentionally does not keep cross-chunk hypotheses.
+        """
+        chunk_start_token = self._stream_token_count
+        hits = self.validator.scan_for_verses(
+            text,
+            min_words=self.options.min_words,
+            max_words=self.options.max_words,
+            confidence_threshold=self.options.min_confidence,
+        )
+
+        complete: list[StreamingQuranHit] = []
+        for item in hits:
+            ref = str(item.get("reference") or "")
+            if not ref:
+                continue
+
+            start_char = int(item.get("start_pos", 0) or 0)
+            end_char = int(item.get("end_pos", start_char) or start_char)
+            start_local = self._word_index_from_char_offset(text, start_char)
+            end_local = self._word_index_from_char_offset(text, end_char)
+            if end_local <= start_local:
+                original = str(item.get("original_text", "") or "")
+                fallback_words = len(original.split())
+                if fallback_words <= 0:
+                    continue
+                end_local = start_local + fallback_words
+            if end_local > len(chunk_words):
+                end_local = len(chunk_words)
+            if end_local <= start_local:
+                continue
+
+            start_global = chunk_start_token + start_local
+            end_global = chunk_start_token + end_local
+
+            verses = item.get("verses") or []
+            verse = verses[0] if verses else None
+            correct_text = str(item.get("correct_text", "") or "")
+            if not correct_text and verse is not None:
+                correct_text = verse.text
+
+            complete.append(StreamingQuranHit(
+                original_text=" ".join(chunk_words[start_local:end_local]),
+                start_token=start_global,
+                end_token=end_global,
+                correct_text=correct_text,
+                reference=ref,
+                confidence=float(item.get("confidence", 0.0) or 0.0),
+                verses=[verse] if verse else [],
+                needs_correction=bool(item.get("needs_correction", False)),
+                translations=dict(item.get("translations") or {}),
+            ))
+
+        self._stream_token_count += len(chunk_words)
+        return StreamingQuranMatcherResult(
+            complete_verses=complete,
+            partial_hypotheses=0,
+            consumed_text=text,
+            stats={
+                "active": 0,
+                "verified": 0,
+                "full_validated": len(hits),
+                "emitted": len(complete),
+                "pending": 0,
+                "mode_main_indexed": 1,
+            },
+        )
 
     def _seed_hypotheses_from_new_words(self, new_start_local: int, new_end_local: int) -> None:
         """Seed/update hypotheses using n-grams that touch newly appended words."""

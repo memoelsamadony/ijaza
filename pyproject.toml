@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ijaza"
-version = "1.2.0"
+version = "2.0.0"
 description = "Validate and verify Quranic verses in LLM-generated text with high accuracy"
 readme = "README.md"
 license = {text = "MIT"}
