@@ -8,8 +8,10 @@ from scratch with many sliding windows.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass, field
+import math
 from typing import TYPE_CHECKING, Optional
 
 from .types import QuranVerse, ValidatorOptions
@@ -35,6 +37,15 @@ class StreamingQuranMatcherOptions:
     min_words: int = 3
     max_words: int = 50
     asr_tolerant: bool = True
+    # Final complete-emit quality gates after local fragment alignment.
+    complete_min_matched_tokens: int = 4
+    complete_min_fragment_chars: int = 12
+    complete_min_coverage_ratio: float = 0.80
+    complete_min_boundary_ratio: float = 0.50
+    complete_short_verse_words: int = 4
+    complete_short_verse_min_confidence: float = 0.95
+    complete_short_verse_min_coverage: float = 0.95
+    complete_short_verse_require_full_boundary: bool = True
 
     # Anchor search
     anchor_ngram_sizes: tuple[int, ...] = (3, 2)
@@ -70,6 +81,27 @@ class StreamingQuranMatcherOptions:
     short_verse_words: int = 8
     min_fuzzy_lexical_overlap: float = 0.45
     min_fuzzy_lexical_overlap_short: float = 0.56
+    # Optional partial-ayah detection path.
+    detect_partial_ayahs: bool = False
+    partial_min_words: int = 3
+    partial_min_fragment_words: int = 4
+    partial_min_overlap_tokens: int = 2
+    partial_min_score: float = 0.45
+    partial_length_sigmoid_center: float = 6.0
+    partial_length_sigmoid_scale: float = 1.6
+    partial_min_distinctiveness: float = 0.22
+    partial_min_distinctiveness_short: float = 0.40
+    partial_collision_penalty_weight: float = 0.26
+    partial_collision_penalty_threshold: float = 0.35
+    partial_collision_reject_ratio: float = 0.70
+    partial_overlap_suppression_ratio: float = 0.70
+    partial_max_emits_per_chunk: int = 4
+    partial_short_verse_words: int = 5
+    partial_short_min_order_ratio: float = 0.80
+    partial_short_require_boundary: bool = True
+    partial_relaxed_min_approx_confidence: float = 0.50
+    partial_relaxed_extra_start_delta: int = 2
+    partial_relaxed_extra_len_delta: int = 2
     # Optional stricter fuzzy gate for very short verses to suppress
     # semantic-near-miss matches that share only common prefixes.
     strict_short_verse_mode: bool = False
@@ -122,6 +154,17 @@ class StreamingQuranHit:
     verses: list[QuranVerse] = field(default_factory=list)
     needs_correction: bool = False
     translations: dict[str, str] = field(default_factory=dict)
+    is_partial: bool = False
+    partial_score: float = 0.0
+    coverage_ratio: float = 0.0
+    purity_ratio: float = 0.0
+    order_ratio: float = 0.0
+    boundary_ratio: float = 0.0
+    distinctiveness_ratio: float = 0.0
+    matched_tokens: int = 0
+    fragment_chars: int = 0
+    collision_ratio: float = 0.0
+    partial_label: str = ""
 
 
 @dataclass
@@ -149,6 +192,7 @@ class StreamingQuranMatcherResult:
     """Result of processing one chunk."""
 
     complete_verses: list[StreamingQuranHit] = field(default_factory=list)
+    partial_ayahs: list[StreamingQuranHit] = field(default_factory=list)
     partial_hypotheses: int = 0
     consumed_text: str = ""
     stats: dict[str, int] = field(default_factory=dict)
@@ -165,6 +209,19 @@ class _ApproxMatch:
     lexical_overlap: float = 0.0
     anchor_mass_ratio: float = 0.0
     chain_coverage: float = 0.0
+
+
+@dataclass
+class _AlignedFragment:
+    """Best aligned fragment inside a candidate window."""
+
+    start_offset: int
+    end_offset: int
+    verse_start: int
+    verse_end: int
+    lcs_count: int
+    overlap_count: int
+    contiguous_run: int
 
 
 @dataclass
@@ -215,6 +272,25 @@ class StreamingQuranMatcher:
     """
 
     _SUPPORTED_MODES = ("stream_v2", "main_indexed_v1")
+    _DEFAULT_TOKEN_IDF = 1.0
+    _HIGH_COLLISION_PARTIAL_PHRASES = (
+        "ان في ذلك",
+        "ان في ذلك لايات",
+        "والله يعلم وانتم لا تعلمون",
+        "الى يوم الدين",
+        "وان كانوا من قبل",
+        "اولئك هم",
+        "بسم الله الرحمن الرحيم",
+    )
+    _HIGH_COLLISION_PARTIAL_FRAGMENTS = {
+        "ان شاء الله",
+        "الى يوم الدين",
+        "والله يعلم وانتم لا تعلمون",
+        "والله يعلم وانتم لا",
+        "يعلم وانتم لا تعلمون",
+        "يعلم وانتم لا",
+        "ان في ذلك لايات",
+    }
 
     def __init__(
         self,
@@ -250,8 +326,13 @@ class StreamingQuranMatcher:
         self._active: dict[tuple[int, int], ActiveHypothesis] = {}
         self._emitted_keys: set[tuple[str, int]] = set()
         self._emitted_spans_by_ref: dict[str, list[tuple[int, int]]] = {}
+        self._partial_emitted_keys: set[tuple[str, int]] = set()
+        self._partial_spans_by_ref: dict[str, list[tuple[int, int]]] = {}
         self._pending_by_ref: dict[str, _PendingEmit] = {}
         self._last_rescue_chunk: int = -10_000
+        self._token_idf: dict[str, float] = {}
+        self._max_token_idf: float = 1.0
+        self._build_token_idf()
 
     def process_chunk(self, text: str) -> StreamingQuranMatcherResult:
         """Process one ASR chunk and emit complete verse matches."""
@@ -268,7 +349,7 @@ class StreamingQuranMatcher:
         self._buffer_norm_words.extend(new_norm_words)
 
         self._seed_hypotheses_from_new_words(before_len, len(self._buffer_words))
-        complete_hits, stats = self._verify_hypotheses(flush=False)
+        complete_hits, partial_hits, stats = self._verify_hypotheses(flush=False)
         rescue_scans = 0
         rescue_emitted = 0
         if self._should_run_rescue_scan(emitted_count=len(complete_hits)):
@@ -289,6 +370,7 @@ class StreamingQuranMatcher:
 
         return StreamingQuranMatcherResult(
             complete_verses=complete_hits,
+            partial_ayahs=partial_hits,
             partial_hypotheses=len(self._active),
             consumed_text=text,
             stats=stats,
@@ -313,9 +395,10 @@ class StreamingQuranMatcher:
             self.reset()
             return result
 
-        complete_hits, stats = self._verify_hypotheses(flush=True)
+        complete_hits, partial_hits, stats = self._verify_hypotheses(flush=True)
         result = StreamingQuranMatcherResult(
             complete_verses=complete_hits,
+            partial_ayahs=partial_hits,
             partial_hypotheses=0,
             consumed_text=" ".join(self._buffer_words),
             stats=stats,
@@ -333,6 +416,8 @@ class StreamingQuranMatcher:
         self._active = {}
         self._emitted_keys = set()
         self._emitted_spans_by_ref = {}
+        self._partial_emitted_keys = set()
+        self._partial_spans_by_ref = {}
         self._pending_by_ref = {}
         self._last_rescue_chunk = -10_000
 
@@ -721,25 +806,33 @@ class StreamingQuranMatcher:
         self._pending_by_ref.pop(reference, None)
         return self._pending_to_hit(existing)
 
-    def _verify_hypotheses(self, *, flush: bool) -> tuple[list[StreamingQuranHit], dict[str, int]]:
+    def _verify_hypotheses(
+        self,
+        *,
+        flush: bool,
+    ) -> tuple[list[StreamingQuranHit], list[StreamingQuranHit], dict[str, int]]:
         """Verify top hypotheses against nearby spans and emit complete matches."""
         if not self._active:
             pending_emitted = self._drain_pending_emits(flush=flush)
-            return pending_emitted, {
+            return pending_emitted, [], {
                 "active": 0,
                 "verified": 0,
                 "full_validated": 0,
                 "emitted": len(pending_emitted),
+                "partial_emitted": 0,
+                "complete_demoted": 0,
                 "pending": len(self._pending_by_ref),
             }
 
         ranked = self._rank_active_hypotheses(self.options.beam_size)
 
         emitted: list[StreamingQuranHit] = self._drain_pending_emits(flush=flush)
+        partial_emitted: list[StreamingQuranHit] = []
         emitted_refs_this_pass: set[str] = {h.reference for h in emitted if h.reference}
         verified_count = 0
         verification_cap = self.options.max_verifications_per_chunk
         full_validated_count = 0
+        complete_demoted = 0
         full_validation_cap = self.options.max_full_validations_per_chunk
         if len(self._active) >= max(1, int(self.options.beam_size * self.options.dense_active_ratio)):
             verification_cap += self.options.extra_verifications_dense
@@ -767,7 +860,12 @@ class StreamingQuranMatcher:
                 h.last_verified_chunk = self._chunk_index
                 continue
 
+            verse_tokens = tuple(self.validator._normalized_verse_words_by_id.get(h.verse_id, ()))
+            if not verse_tokens:
+                verse_tokens = tuple(_normalize_scan_token(w) for w in verse.text.split())
+
             candidate_matches: list[_ApproxMatch] = []
+            partial_candidates: list[_ApproxMatch] = []
             uncertain_chain = (
                 chain.coverage_ratio < self.options.adaptive_expand_coverage_threshold
                 or chain.support_ratio < self.options.adaptive_expand_support_threshold
@@ -787,6 +885,14 @@ class StreamingQuranMatcher:
                     local_min_approx,
                     max(0.52, self.options.min_approx_confidence - 0.14),
                 )
+            detect_partials = self.options.detect_partial_ayahs
+            partial_min_approx = max(
+                0.35,
+                float(self.options.partial_relaxed_min_approx_confidence),
+            )
+            scoring_min_approx = local_min_approx
+            if detect_partials:
+                scoring_min_approx = min(scoring_min_approx, partial_min_approx)
             local_verification_cap = self.options.max_verifications_per_hypothesis
             if uncertain_chain:
                 local_verification_cap = self.options.max_verifications_per_hypothesis_uncertain
@@ -835,23 +941,30 @@ class StreamingQuranMatcher:
                         verse_wc=verse_wc,
                         start_global=start_global,
                         end_global=end_global,
+                        min_confidence=scoring_min_approx,
                     )
-                    if approx is None or approx.approx_confidence < local_min_approx:
+                    if approx is None:
                         continue
-
-                    candidate_matches.append(approx)
+                    if approx.approx_confidence >= local_min_approx:
+                        candidate_matches.append(approx)
+                        continue
+                    if detect_partials and approx.approx_confidence >= partial_min_approx:
+                        partial_candidates.append(approx)
 
             h.last_verified_chunk = self._chunk_index
+            best_approx_this_h = 0.0
             if candidate_matches:
+                best_approx_this_h = max(best_approx_this_h, max(m.approx_confidence for m in candidate_matches))
+            if partial_candidates:
+                best_approx_this_h = max(best_approx_this_h, max(m.approx_confidence for m in partial_candidates))
+            if best_approx_this_h > 0.0:
                 h.best_confidence = max(
                     h.best_confidence,
-                    max(m.approx_confidence for m in candidate_matches),
+                    best_approx_this_h,
                 )
 
-                verse_tokens = tuple(self.validator._normalized_verse_words_by_id.get(h.verse_id, ()))
-                if not verse_tokens:
-                    verse_tokens = tuple(_normalize_scan_token(w) for w in verse.text.split())
-
+            emitted_complete_for_h = False
+            if candidate_matches:
                 selected_candidates = self._select_emit_candidates(
                     candidate_matches,
                     limit=self.options.max_emit_window_candidates,
@@ -882,10 +995,53 @@ class StreamingQuranMatcher:
                     if not result.is_valid or result.confidence < self.options.min_confidence:
                         continue
 
+                    emit_start_local = start_local
+                    emit_end_local = end_local
+                    emit_verse_start = 0
+                    emit_verse_end = len(verse_tokens)
+                    aligned = self._align_fragment_to_verse(
+                        tuple(self._buffer_norm_words[start_local:end_local]),
+                        verse_tokens,
+                        min_match_tokens=max(2, self.options.partial_min_overlap_tokens),
+                    )
+                    if aligned is not None:
+                        emit_start_local = start_local + aligned.start_offset
+                        emit_end_local = start_local + aligned.end_offset
+                        emit_verse_start = aligned.verse_start
+                        emit_verse_end = aligned.verse_end
+
+                    if emit_end_local <= emit_start_local:
+                        continue
+                    emit_start_global = self._buffer_start_token + emit_start_local
+                    emit_end_global = self._buffer_start_token + emit_end_local
+                    emit_window_text = " ".join(self._buffer_words[emit_start_local:emit_end_local])
+                    emit_window_norm = tuple(self._buffer_norm_words[emit_start_local:emit_end_local])
+
+                    matched_tokens = aligned.overlap_count if aligned is not None else 0
+                    fragment_chars = self._fragment_char_count(emit_window_norm)
+                    coverage_ratio = (
+                        matched_tokens / max(1, len(verse_tokens))
+                        if verse_tokens
+                        else 0.0
+                    )
+                    boundary_ratio = 0.0
+                    complete_ok = True
+                    if detect_partials:
+                        complete_ok, matched_tokens, fragment_chars, coverage_ratio, boundary_ratio = (
+                            self._complete_passes_quality_gates(
+                                aligned=aligned,
+                                window_tokens=emit_window_norm,
+                                verse_tokens=verse_tokens,
+                                confidence=result.confidence,
+                            )
+                        )
+                    if not complete_ok:
+                        complete_demoted += 1
+                        continue
+
                     strong_fuzzy_emit = False
                     if result.match_type == "fuzzy":
-                        window_norm = tuple(self._buffer_norm_words[start_local:end_local])
-                        lexical_overlap = self._token_multiset_overlap_ratio(window_norm, verse_tokens)
+                        lexical_overlap = self._token_multiset_overlap_ratio(emit_window_norm, verse_tokens)
                         min_overlap = self._min_required_fuzzy_overlap(
                             verse_words=len(verse_tokens),
                             confidence=result.confidence,
@@ -904,8 +1060,8 @@ class StreamingQuranMatcher:
                             ):
                                 first_tok = verse_tokens[0] if verse_tokens else ""
                                 last_tok = verse_tokens[-1] if verse_tokens else ""
-                                has_first = first_tok in window_norm if first_tok else True
-                                has_last = last_tok in window_norm if last_tok else True
+                                has_first = first_tok in emit_window_norm if first_tok else True
+                                has_last = last_tok in emit_window_norm if last_tok else True
                                 if not (has_first and has_last):
                                     continue
                         strong_overlap_threshold = self.options.strong_fuzzy_emit_overlap
@@ -934,10 +1090,10 @@ class StreamingQuranMatcher:
                     ):
                         pending_hit = self._update_pending_emit(
                             reference=ref,
-                            start_token=start_global,
-                            end_token=end_global,
+                            start_token=emit_start_global,
+                            end_token=emit_end_global,
                             result=result,
-                            original_text=window_text,
+                            original_text=emit_window_text,
                             require_cross_chunk_confirmation=(
                                 len(verse_tokens) >= self.options.strong_fuzzy_emit_long_verse_words
                             ),
@@ -963,50 +1119,125 @@ class StreamingQuranMatcher:
                                 emitted.append(pending_hit)
                                 emitted_refs_this_pass.add(pending_hit.reference)
                                 self._active.pop((h.verse_id, h.candidate_start_token), None)
+                                emitted_complete_for_h = True
                                 break
                         continue
 
-                    emit_key = (ref, start_global)
+                    emit_key = (ref, emit_start_global)
                     if emit_key in self._emitted_keys:
                         continue
                     if self._is_duplicate_reference_span(
                         ref,
-                        start_global,
-                        end_global,
+                        emit_start_global,
+                        emit_end_global,
                     ):
                         continue
                     self._emitted_keys.add(emit_key)
                     self._record_emitted_reference_span(
                         ref,
-                        start_global,
-                        end_global,
+                        emit_start_global,
+                        emit_end_global,
                     )
                     if ref:
                         emitted_refs_this_pass.add(ref)
 
                     verse_obj = result.matched_verse
                     emitted.append(StreamingQuranHit(
-                        original_text=window_text,
-                        start_token=start_global,
-                        end_token=end_global,
+                        original_text=emit_window_text,
+                        start_token=emit_start_global,
+                        end_token=emit_end_global,
                         correct_text=verse_obj.text if verse_obj else "",
                         reference=ref,
                         confidence=result.confidence,
                         verses=[verse_obj] if verse_obj else [],
                         needs_correction=(result.match_type != "exact"),
                         translations=result.translations,
+                        coverage_ratio=coverage_ratio,
+                        boundary_ratio=boundary_ratio,
+                        matched_tokens=matched_tokens,
+                        fragment_chars=fragment_chars,
                     ))
 
                     # Prevent repeated detections for the same anchored hypothesis.
                     self._active.pop((h.verse_id, h.candidate_start_token), None)
                     self._pending_by_ref.pop(ref, None)
+                    emitted_complete_for_h = True
                     break
 
-        return emitted, {
+            if (
+                detect_partials
+                and not emitted_complete_for_h
+                and len(partial_emitted) < self.options.partial_max_emits_per_chunk
+            ):
+                partial_pool = list(candidate_matches)
+                partial_pool.extend(partial_candidates)
+                if partial_pool:
+                    selected_partial = self._select_emit_candidates(
+                        partial_pool,
+                        limit=max(
+                            self.options.max_emit_window_candidates,
+                            self.options.partial_max_emits_per_chunk * 2,
+                        ),
+                    )
+                    selected_partial = self._suppress_overlapping_approx_matches(
+                        selected_partial,
+                        overlap_ratio=self.options.partial_overlap_suppression_ratio,
+                        limit=max(
+                            self.options.max_emit_window_candidates,
+                            self.options.partial_max_emits_per_chunk * 2,
+                        ),
+                    )
+                    for match in selected_partial:
+                        if len(partial_emitted) >= self.options.partial_max_emits_per_chunk:
+                            break
+                        start_local = match.start_local
+                        end_local = match.end_local
+                        start_global = self._buffer_start_token + start_local
+                        end_global = self._buffer_start_token + end_local
+                        partial_hit = self._build_partial_hit(
+                            verse=verse,
+                            verse_tokens=verse_tokens,
+                            start_local=start_local,
+                            end_local=end_local,
+                            start_global=start_global,
+                            end_global=end_global,
+                            approx_confidence=match.approx_confidence,
+                        )
+                        if partial_hit is None:
+                            continue
+                        if partial_hit.reference:
+                            emit_key = (partial_hit.reference, partial_hit.start_token)
+                            if emit_key in self._partial_emitted_keys:
+                                continue
+                            if emit_key in self._emitted_keys:
+                                continue
+                            if self._is_duplicate_reference_span(
+                                partial_hit.reference,
+                                partial_hit.start_token,
+                                partial_hit.end_token,
+                            ):
+                                continue
+                            if self._is_duplicate_partial_reference_span(
+                                partial_hit.reference,
+                                partial_hit.start_token,
+                                partial_hit.end_token,
+                            ):
+                                continue
+                            self._partial_emitted_keys.add(emit_key)
+                            self._record_partial_reference_span(
+                                partial_hit.reference,
+                                partial_hit.start_token,
+                                partial_hit.end_token,
+                            )
+                        partial_emitted.append(partial_hit)
+
+        return emitted, partial_emitted, {
             "active": len(self._active),
             "verified": verified_count,
             "full_validated": full_validated_count,
             "emitted": len(emitted),
+            "partial_emitted": len(partial_emitted),
+            "complete_demoted": complete_demoted,
             "pending": len(self._pending_by_ref),
         }
 
@@ -1286,6 +1517,7 @@ class StreamingQuranMatcher:
         verse_wc: int,
         start_global: int,
         end_global: int,
+        min_confidence: Optional[float] = None,
     ) -> Optional[_ApproxMatch]:
         """Score a candidate window using chained anchor evidence only."""
         if end_global <= start_global:
@@ -1350,7 +1582,10 @@ class StreamingQuranMatcher:
         )
         confidence = max(0.0, min(0.99, confidence))
 
-        if confidence < self.options.min_approx_confidence:
+        threshold = self.options.min_approx_confidence
+        if min_confidence is not None:
+            threshold = min_confidence
+        if confidence < threshold:
             return None
 
         start_local = start_global - self._buffer_start_token
@@ -1368,6 +1603,163 @@ class StreamingQuranMatcher:
             chain_coverage=chain.coverage_ratio,
         )
 
+    def _build_token_idf(self) -> None:
+        """Build per-token IDF statistics over Quran verses for partial scoring."""
+        verse_tokens_iter = self.validator._normalized_verse_words_by_id.values()
+        df: Counter[str] = Counter()
+        verse_count = 0
+        for toks in verse_tokens_iter:
+            verse_count += 1
+            for tok in set(t for t in toks if t):
+                df[tok] += 1
+
+        if verse_count <= 0:
+            self._token_idf = {}
+            self._max_token_idf = self._DEFAULT_TOKEN_IDF
+            return
+
+        token_idf: dict[str, float] = {}
+        max_idf = 0.0
+        for tok, freq in df.items():
+            idf = math.log((1.0 + verse_count) / (1.0 + freq)) + 1.0
+            token_idf[tok] = idf
+            if idf > max_idf:
+                max_idf = idf
+
+        self._token_idf = token_idf
+        self._max_token_idf = max(max_idf, self._DEFAULT_TOKEN_IDF)
+
+    def _align_fragment_to_verse(
+        self,
+        window_tokens: tuple[str, ...],
+        verse_tokens: tuple[str, ...],
+        *,
+        min_match_tokens: int,
+    ) -> Optional[_AlignedFragment]:
+        """Find a dense aligned token fragment inside a candidate window."""
+        if not window_tokens or not verse_tokens:
+            return None
+
+        pairs = self._lcs_token_pairs(window_tokens, verse_tokens)
+        if len(pairs) < max(1, min_match_tokens):
+            return None
+
+        # Pick the densest aligned region (maximize matches, minimize noise).
+        best_start = 0
+        best_end = len(window_tokens)
+        best_score = float("-inf")
+        best_match_count = 0
+        best_span_len = len(window_tokens)
+        k = len(pairs)
+        for i in range(k):
+            start_i = pairs[i][0]
+            for j in range(i, k):
+                end_i = pairs[j][0] + 1
+                match_count = j - i + 1
+                span_len = max(1, end_i - start_i)
+                noise = span_len - match_count
+                score = (1.15 * match_count) - (0.45 * noise)
+                if (
+                    score > best_score
+                    or (score == best_score and match_count > best_match_count)
+                    or (
+                        score == best_score
+                        and match_count == best_match_count
+                        and span_len < best_span_len
+                    )
+                ):
+                    best_score = score
+                    best_start = start_i
+                    best_end = end_i
+                    best_match_count = match_count
+                    best_span_len = span_len
+
+        selected_pairs = [(w_i, v_i) for (w_i, v_i) in pairs if best_start <= w_i < best_end]
+        if len(selected_pairs) < max(1, min_match_tokens):
+            return None
+
+        verse_positions = [v_i for _w_i, v_i in selected_pairs]
+        verse_start = min(verse_positions)
+        verse_end = max(verse_positions) + 1
+
+        overlap_count = self._token_multiset_overlap_count(
+            window_tokens[best_start:best_end],
+            verse_tokens,
+        )
+        contiguous_run = self._longest_monotonic_run(selected_pairs)
+
+        return _AlignedFragment(
+            start_offset=best_start,
+            end_offset=best_end,
+            verse_start=verse_start,
+            verse_end=verse_end,
+            lcs_count=len(selected_pairs),
+            overlap_count=overlap_count,
+            contiguous_run=contiguous_run,
+        )
+
+    @staticmethod
+    def _lcs_token_pairs(
+        window_tokens: tuple[str, ...],
+        verse_tokens: tuple[str, ...],
+    ) -> list[tuple[int, int]]:
+        """Return one deterministic LCS alignment as (window_idx, verse_idx) pairs."""
+        n = len(window_tokens)
+        m = len(verse_tokens)
+        if n == 0 or m == 0:
+            return []
+
+        dp = [[0] * (m + 1) for _ in range(n + 1)]
+        for i in range(1, n + 1):
+            w_tok = window_tokens[i - 1]
+            row = dp[i]
+            prev_row = dp[i - 1]
+            for j in range(1, m + 1):
+                if w_tok == verse_tokens[j - 1]:
+                    row[j] = prev_row[j - 1] + 1
+                else:
+                    left = row[j - 1]
+                    up = prev_row[j]
+                    row[j] = up if up >= left else left
+
+        pairs_rev: list[tuple[int, int]] = []
+        i = n
+        j = m
+        while i > 0 and j > 0:
+            if (
+                window_tokens[i - 1] == verse_tokens[j - 1]
+                and dp[i][j] == dp[i - 1][j - 1] + 1
+            ):
+                pairs_rev.append((i - 1, j - 1))
+                i -= 1
+                j -= 1
+                continue
+
+            if dp[i - 1][j] >= dp[i][j - 1]:
+                i -= 1
+            else:
+                j -= 1
+
+        return list(reversed(pairs_rev))
+
+    @staticmethod
+    def _longest_monotonic_run(pairs: list[tuple[int, int]]) -> int:
+        """Longest contiguous monotonic run in an aligned token pair list."""
+        if not pairs:
+            return 0
+        best = 1
+        run = 1
+        for idx in range(1, len(pairs)):
+            prev_w, prev_v = pairs[idx - 1]
+            cur_w, cur_v = pairs[idx]
+            if cur_w == (prev_w + 1) and cur_v == (prev_v + 1):
+                run += 1
+            else:
+                run = 1
+            if run > best:
+                best = run
+        return best
+
     @staticmethod
     def _token_multiset_overlap_ratio(
         input_tokens: tuple[str, ...],
@@ -1377,12 +1769,404 @@ class StreamingQuranMatcher:
         if not input_tokens or not verse_tokens:
             return 0.0
 
+        overlap = StreamingQuranMatcher._token_multiset_overlap_count(input_tokens, verse_tokens)
+        return overlap / max(1, len(verse_tokens))
+
+    @staticmethod
+    def _token_multiset_overlap_count(
+        input_tokens: tuple[str, ...],
+        verse_tokens: tuple[str, ...],
+    ) -> int:
+        """Count multiset overlap between input and verse token bags."""
+        if not input_tokens or not verse_tokens:
+            return 0
         input_counts = Counter(input_tokens)
         verse_counts = Counter(verse_tokens)
         overlap = 0
         for token, v_count in verse_counts.items():
             overlap += min(v_count, input_counts.get(token, 0))
-        return overlap / max(1, len(verse_tokens))
+        return overlap
+
+    @staticmethod
+    def _ordered_token_match_count(
+        input_tokens: tuple[str, ...],
+        verse_tokens: tuple[str, ...],
+    ) -> int:
+        """Greedy monotonic token match count against verse token order."""
+        if not input_tokens or not verse_tokens:
+            return 0
+        positions: dict[str, list[int]] = {}
+        for idx, token in enumerate(verse_tokens):
+            if token:
+                positions.setdefault(token, []).append(idx)
+
+        matched = 0
+        last_pos = -1
+        for token in input_tokens:
+            if not token:
+                continue
+            pos_list = positions.get(token)
+            if not pos_list:
+                continue
+            k = bisect_left(pos_list, last_pos + 1)
+            if k >= len(pos_list):
+                continue
+            last_pos = pos_list[k]
+            matched += 1
+            if last_pos >= (len(verse_tokens) - 1):
+                break
+        return matched
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        """Numerically stable logistic helper."""
+        if x >= 40.0:
+            return 1.0
+        if x <= -40.0:
+            return 0.0
+        return 1.0 / (1.0 + math.exp(-x))
+
+    @staticmethod
+    def _fragment_char_count(tokens: tuple[str, ...]) -> int:
+        """Count non-space characters in a token fragment."""
+        return sum(len(t) for t in tokens if t)
+
+    def _partial_length_factor(self, matched_tokens: int) -> float:
+        """Length-aware attenuation so short fragments cannot look perfect."""
+        center = float(self.options.partial_length_sigmoid_center)
+        scale = max(0.25, float(self.options.partial_length_sigmoid_scale))
+        base = self._sigmoid((float(matched_tokens) - center) / scale)
+        return 0.40 + (0.60 * base)
+
+    def _collision_phrase_ratio(
+        self,
+        fragment_tokens: tuple[str, ...],
+        *,
+        overlap_count: int,
+    ) -> float:
+        """
+        Measure how much overlap mass comes from high-collision phrase templates.
+        """
+        if not fragment_tokens:
+            return 0.0
+        marks = [False] * len(fragment_tokens)
+        for phrase in self._HIGH_COLLISION_PARTIAL_PHRASES:
+            p_tokens = tuple(phrase.split())
+            n = len(p_tokens)
+            if n <= 0 or n > len(fragment_tokens):
+                continue
+            limit = len(fragment_tokens) - n + 1
+            for i in range(limit):
+                if fragment_tokens[i:i + n] == p_tokens:
+                    for j in range(i, i + n):
+                        marks[j] = True
+        collision_tokens = sum(1 for m in marks if m)
+        if collision_tokens <= 0:
+            return 0.0
+        return min(1.0, collision_tokens / max(1, overlap_count))
+
+    @staticmethod
+    def _span_overlap_ratio(
+        a_start: int,
+        a_end: int,
+        b_start: int,
+        b_end: int,
+    ) -> float:
+        """Normalized span overlap by shorter span length."""
+        overlap = min(a_end, b_end) - max(a_start, b_start)
+        if overlap <= 0:
+            return 0.0
+        a_len = max(1, a_end - a_start)
+        b_len = max(1, b_end - b_start)
+        return overlap / max(1, min(a_len, b_len))
+
+    def _suppress_overlapping_approx_matches(
+        self,
+        candidates: list[_ApproxMatch],
+        *,
+        overlap_ratio: float,
+        limit: int,
+    ) -> list[_ApproxMatch]:
+        """Keep strongest non-overlapping candidate windows for partial emits."""
+        if not candidates or limit <= 0:
+            return []
+        threshold = max(0.0, min(1.0, overlap_ratio))
+        ranked = sorted(
+            candidates,
+            key=lambda m: (
+                -m.approx_confidence,
+                -m.lexical_overlap,
+                -m.anchor_mass_ratio,
+                -(m.end_local - m.start_local),
+                m.start_local,
+            ),
+        )
+        selected: list[_ApproxMatch] = []
+        for cand in ranked:
+            if len(selected) >= limit:
+                break
+            suppress = False
+            for prev in selected:
+                ov = self._span_overlap_ratio(
+                    cand.start_local,
+                    cand.end_local,
+                    prev.start_local,
+                    prev.end_local,
+                )
+                if ov >= threshold:
+                    suppress = True
+                    break
+            if suppress:
+                continue
+            selected.append(cand)
+        return selected
+
+    def _complete_passes_quality_gates(
+        self,
+        *,
+        aligned: Optional[_AlignedFragment],
+        window_tokens: tuple[str, ...],
+        verse_tokens: tuple[str, ...],
+        confidence: float,
+    ) -> tuple[bool, int, int, float, float]:
+        """Apply final complete-hit quality gates using aligned-fragment metrics."""
+        if not window_tokens or not verse_tokens:
+            return False, 0, 0, 0.0, 0.0
+
+        if aligned is not None:
+            matched_tokens = int(aligned.overlap_count)
+            boundary_left = 1.0 if aligned.verse_start <= 0 else 0.0
+            boundary_right = 1.0 if aligned.verse_end >= len(verse_tokens) else 0.0
+            boundary_ratio = 0.5 * (boundary_left + boundary_right)
+        else:
+            matched_tokens = self._token_multiset_overlap_count(window_tokens, verse_tokens)
+            if len(verse_tokens) == 1:
+                boundary_ratio = 1.0 if verse_tokens[0] in window_tokens else 0.0
+            else:
+                first_tok = verse_tokens[0]
+                last_tok = verse_tokens[-1]
+                boundary_ratio = (
+                    (1.0 if first_tok in window_tokens else 0.0)
+                    + (1.0 if last_tok in window_tokens else 0.0)
+                ) / 2.0
+
+        fragment_chars = self._fragment_char_count(window_tokens)
+        coverage_ratio = matched_tokens / max(1, len(verse_tokens))
+
+        is_short_verse = len(verse_tokens) <= self.options.complete_short_verse_words
+        if is_short_verse:
+            ok = (
+                confidence >= self.options.complete_short_verse_min_confidence
+                and coverage_ratio >= self.options.complete_short_verse_min_coverage
+            )
+            if self.options.complete_short_verse_require_full_boundary:
+                ok = ok and (boundary_ratio >= 1.0)
+            return ok, matched_tokens, fragment_chars, coverage_ratio, boundary_ratio
+
+        ok = (
+            matched_tokens >= self.options.complete_min_matched_tokens
+            and fragment_chars >= self.options.complete_min_fragment_chars
+        )
+        if not ok:
+            return False, matched_tokens, fragment_chars, coverage_ratio, boundary_ratio
+
+        if (
+            coverage_ratio >= self.options.complete_min_coverage_ratio
+            and boundary_ratio >= self.options.complete_min_boundary_ratio
+        ):
+            return True, matched_tokens, fragment_chars, coverage_ratio, boundary_ratio
+
+        # Fallback for noisy-ASR complete hits: if the aligned fragment carries
+        # enough lexical mass, allow complete emission even with weak boundaries.
+        strong_token_mass = matched_tokens >= max(8, int(0.55 * len(verse_tokens)))
+        high_confidence = confidence >= max(self.options.min_confidence + 0.03, 0.86)
+        ok = strong_token_mass or high_confidence
+        return ok, matched_tokens, fragment_chars, coverage_ratio, boundary_ratio
+
+    @staticmethod
+    def _partial_label(
+        *,
+        coverage_ratio: float,
+        purity_ratio: float,
+        order_ratio: float,
+    ) -> str:
+        """Bucket partial quality into stable labels for downstream logic."""
+        if coverage_ratio >= 0.82 and order_ratio >= 0.82 and purity_ratio >= 0.55:
+            return "near_complete"
+        if coverage_ratio >= 0.60 and order_ratio >= 0.70:
+            return "strong"
+        if coverage_ratio >= 0.45 and purity_ratio >= 0.35:
+            return "medium"
+        return "weak"
+
+    def _build_partial_hit(
+        self,
+        *,
+        verse: QuranVerse,
+        verse_tokens: tuple[str, ...],
+        start_local: int,
+        end_local: int,
+        start_global: int,
+        end_global: int,
+        approx_confidence: float,
+    ) -> Optional[StreamingQuranHit]:
+        """Build a partial hit candidate from a scored approximate window."""
+        if end_local <= start_local:
+            return None
+        if start_local < 0 or end_local > len(self._buffer_words):
+            return None
+        if not verse_tokens:
+            return None
+
+        full_window_norm = tuple(self._buffer_norm_words[start_local:end_local])
+        if not full_window_norm:
+            return None
+        aligned = self._align_fragment_to_verse(
+            full_window_norm,
+            verse_tokens,
+            min_match_tokens=max(1, self.options.partial_min_overlap_tokens),
+        )
+        if aligned is None:
+            return None
+
+        frag_start_local = start_local + aligned.start_offset
+        frag_end_local = start_local + aligned.end_offset
+        if frag_end_local <= frag_start_local:
+            return None
+
+        window_norm = tuple(self._buffer_norm_words[frag_start_local:frag_end_local])
+        if not window_norm:
+            return None
+        fragment_norm_text = " ".join(window_norm)
+        if fragment_norm_text in self._HIGH_COLLISION_PARTIAL_FRAGMENTS:
+            return None
+
+        min_fragment_words = max(
+            int(self.options.partial_min_words),
+            int(self.options.partial_min_fragment_words),
+        )
+        if len(window_norm) < min_fragment_words:
+            return None
+
+        overlap_count = aligned.overlap_count
+        if overlap_count < max(1, self.options.partial_min_overlap_tokens):
+            return None
+        if overlap_count < max(1, self.options.partial_min_words):
+            return None
+
+        fragment_chars = self._fragment_char_count(window_norm)
+        coverage_ratio = overlap_count / max(1, len(verse_tokens))
+        purity_ratio_raw = overlap_count / max(1, len(window_norm))
+        ordered_count = self._ordered_token_match_count(window_norm, verse_tokens)
+        order_ratio_raw = ordered_count / max(1, overlap_count)
+        length_factor = self._partial_length_factor(overlap_count)
+        purity_ratio = purity_ratio_raw * length_factor
+        order_ratio = order_ratio_raw * length_factor
+        collision_ratio = self._collision_phrase_ratio(
+            window_norm,
+            overlap_count=overlap_count,
+        )
+        if collision_ratio >= self.options.partial_collision_reject_ratio:
+            return None
+
+        matched_idf_mass = 0.0
+        input_counts = Counter(window_norm)
+        verse_counts = Counter(verse_tokens)
+        for token, v_count in verse_counts.items():
+            m = min(v_count, input_counts.get(token, 0))
+            if m <= 0:
+                continue
+            matched_idf_mass += self._token_idf.get(token, self._DEFAULT_TOKEN_IDF) * m
+        avg_matched_idf = matched_idf_mass / max(1, overlap_count)
+        distinctiveness_ratio = avg_matched_idf / max(self._max_token_idf, self._DEFAULT_TOKEN_IDF)
+        distinctiveness_ratio = max(0.0, min(1.0, distinctiveness_ratio))
+
+        if len(verse_tokens) == 1:
+            boundary_ratio = 1.0 if verse_tokens[0] in window_norm else 0.0
+        else:
+            first_tok = verse_tokens[0]
+            last_tok = verse_tokens[-1]
+            boundary_ratio = (
+                (1.0 if first_tok in window_norm else 0.0)
+                + (1.0 if last_tok in window_norm else 0.0)
+            ) / 2.0
+
+        approx_norm = max(0.0, min(1.0, (approx_confidence - 0.40) / 0.60))
+        partial_score = (
+            0.34 * coverage_ratio
+            + 0.22 * purity_ratio
+            + 0.18 * order_ratio
+            + 0.08 * boundary_ratio
+            + 0.08 * approx_norm
+            + 0.10 * distinctiveness_ratio
+        )
+        if collision_ratio > self.options.partial_collision_penalty_threshold:
+            span = max(1e-6, 1.0 - self.options.partial_collision_penalty_threshold)
+            excess = (collision_ratio - self.options.partial_collision_penalty_threshold) / span
+            partial_score -= self.options.partial_collision_penalty_weight * excess
+        # Hard floor for very short aligned fragments.
+        if (
+            overlap_count < self.options.complete_min_matched_tokens
+            or fragment_chars < self.options.complete_min_fragment_chars
+        ):
+            partial_score = min(
+                partial_score,
+                min(self.options.partial_min_score - 1e-6, 0.44),
+            )
+        partial_score = max(0.0, min(0.99, partial_score))
+
+        if distinctiveness_ratio < self.options.partial_min_distinctiveness:
+            return None
+        if len(window_norm) <= max(5, self.options.partial_short_verse_words):
+            if distinctiveness_ratio < self.options.partial_min_distinctiveness_short:
+                return None
+
+        if partial_score < self.options.partial_min_score:
+            return None
+        if len(verse_tokens) <= self.options.partial_short_verse_words:
+            if order_ratio_raw < self.options.partial_short_min_order_ratio:
+                return None
+            if self.options.partial_short_require_boundary and boundary_ratio < 0.50:
+                return None
+
+        label = self._partial_label(
+            coverage_ratio=coverage_ratio,
+            purity_ratio=purity_ratio,
+            order_ratio=order_ratio,
+        )
+        original_text = " ".join(self._buffer_words[frag_start_local:frag_end_local])
+        verse_words = verse.text.split()
+        verse_start = max(0, min(aligned.verse_start, len(verse_words)))
+        verse_end = max(verse_start + 1, min(aligned.verse_end, len(verse_words)))
+        correct_fragment = " ".join(verse_words[verse_start:verse_end]) if verse_words else verse.text
+        translations: dict[str, str] = {}
+        if self._translation_provider is not None:
+            translations = self._translation_provider.get_translations(
+                verse.surah,
+                verse.ayah,
+            )
+        return StreamingQuranHit(
+            original_text=original_text,
+            start_token=self._buffer_start_token + frag_start_local,
+            end_token=self._buffer_start_token + frag_end_local,
+            correct_text=correct_fragment,
+            reference=f"{verse.surah}:{verse.ayah}",
+            confidence=partial_score,
+            verses=[verse],
+            needs_correction=True,
+            translations=translations,
+            is_partial=True,
+            partial_score=partial_score,
+            coverage_ratio=coverage_ratio,
+            purity_ratio=purity_ratio,
+            order_ratio=order_ratio,
+            boundary_ratio=boundary_ratio,
+            distinctiveness_ratio=distinctiveness_ratio,
+            matched_tokens=overlap_count,
+            fragment_chars=fragment_chars,
+            collision_ratio=collision_ratio,
+            partial_label=label,
+        )
 
     def _min_required_fuzzy_overlap(self, verse_words: int, confidence: float) -> float:
         """Adaptive lexical-overlap requirement for fuzzy emits."""
@@ -1463,6 +2247,22 @@ class StreamingQuranMatcher:
             return False
 
         prior_spans = self._emitted_spans_by_ref.get(reference)
+        return self._is_duplicate_reference_span_from_list(
+            prior_spans,
+            start_token=start_token,
+            end_token=end_token,
+            duplicate_ref_window_tokens=self.options.duplicate_ref_window_tokens,
+        )
+
+    @staticmethod
+    def _is_duplicate_reference_span_from_list(
+        prior_spans: Optional[list[tuple[int, int]]],
+        *,
+        start_token: int,
+        end_token: int,
+        duplicate_ref_window_tokens: int,
+    ) -> bool:
+        """Check overlap/near-adjacent duplication against a span list."""
         if not prior_spans:
             return False
 
@@ -1472,7 +2272,7 @@ class StreamingQuranMatcher:
             overlap = min(end_token, prev_end) - max(start_token, prev_start)
             if overlap <= 0:
                 # Also suppress near-adjacent repeats from chunk overlap carryover.
-                if abs(start_token - prev_start) <= self.options.duplicate_ref_window_tokens:
+                if abs(start_token - prev_start) <= duplicate_ref_window_tokens:
                     length_ratio = min(span_len, prev_len) / max(span_len, prev_len)
                     if length_ratio >= 0.65:
                         return True
@@ -1496,11 +2296,63 @@ class StreamingQuranMatcher:
         if not reference or end_token <= start_token:
             return
 
-        spans = self._emitted_spans_by_ref.setdefault(reference, [])
+        self._record_reference_span_to_store(
+            self._emitted_spans_by_ref,
+            reference=reference,
+            start_token=start_token,
+            end_token=end_token,
+            max_keep=48,
+        )
+
+    def _is_duplicate_partial_reference_span(
+        self,
+        reference: str,
+        start_token: int,
+        end_token: int,
+    ) -> bool:
+        """Check if this partial span is a duplicate of prior partial emissions."""
+        if not reference or end_token <= start_token:
+            return False
+        prior_spans = self._partial_spans_by_ref.get(reference)
+        return self._is_duplicate_reference_span_from_list(
+            prior_spans,
+            start_token=start_token,
+            end_token=end_token,
+            duplicate_ref_window_tokens=self.options.duplicate_ref_window_tokens,
+        )
+
+    def _record_partial_reference_span(
+        self,
+        reference: str,
+        start_token: int,
+        end_token: int,
+    ) -> None:
+        """Remember emitted partial span for duplicate suppression."""
+        if not reference or end_token <= start_token:
+            return
+        self._record_reference_span_to_store(
+            self._partial_spans_by_ref,
+            reference=reference,
+            start_token=start_token,
+            end_token=end_token,
+            max_keep=64,
+        )
+
+    @staticmethod
+    def _record_reference_span_to_store(
+        store: dict[str, list[tuple[int, int]]],
+        *,
+        reference: str,
+        start_token: int,
+        end_token: int,
+        max_keep: int,
+    ) -> None:
+        """Append span into the provided store while bounding memory."""
+        spans = store.setdefault(reference, [])
         spans.append((start_token, end_token))
         # Keep bounded memory for long live streams.
-        if len(spans) > 48:
-            del spans[:-48]
+        if len(spans) > max_keep:
+            del spans[:-max_keep]
 
     def _prune_hypotheses(self) -> None:
         """Drop stale/weak hypotheses and keep the beam bounded."""
